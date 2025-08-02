@@ -278,10 +278,16 @@ provers/sp1/proofs/
 
 # data files
 .data/
+/*.json
+
+# ephemeral docker volume data
+**/vol/**/data
+**/vol/**/migrations
 
 # binary dumps
 *.bin
 *.borsh
+*.pb.gz
 
 # test data
 !test-data/*.bin
@@ -290,7 +296,10 @@ provers/sp1/proofs/
 seed
 certs
 
-# certificates and private keys in der format
-*.der
+# certificates and private keys in pem format
+*.pem
 
-tls/
+# vk files
+*.vk
+*.sp1vk
+*.hex

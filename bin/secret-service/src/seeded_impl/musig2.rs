@@ -1,24 +1,34 @@
 //! In-memory persistence for MuSig2's secret data.
 
+use std::{
+    collections::HashMap,
+    hash::{BuildHasher, RandomState},
+    sync::LazyLock,
+};
+
 use bitcoin::{
     bip32::Xpriv,
-    hashes::Hash,
-    key::{Keypair, Parity},
-    Txid, XOnlyPublicKey,
+    hashes::Hash as _,
+    key::{Keypair, Parity, TapTweak},
+    TapNodeHash, XOnlyPublicKey,
 };
+use cache_advisor::CacheAdvisor;
 use hkdf::Hkdf;
 use make_buf::make_buf;
 use musig2::{
-    errors::{RoundContributionError, RoundFinalizeError},
-    secp256k1::{SecretKey, SECP256K1},
-    FirstRound, KeyAggContext, LiftedSignature, SecNonceSpices, SecondRound,
+    errors::SigningError,
+    secp::{MaybePoint, Point},
+    secp256k1::{schnorr::Signature, Message, SECP256K1},
+    AggNonce, KeyAggContext, PartialSignature, PubNonce, SecNonce, SecNonceSpices,
 };
-use secret_service_proto::v1::traits::{
-    Musig2Signer, Musig2SignerFirstRound, Musig2SignerSecondRound, Origin, Server,
-    SignerIdxOutOfBounds,
+use secret_service_proto::v2::traits::{
+    Musig2Params, Musig2Signer, Origin, OurPubKeyIsNotInParams, SchnorrSigner, SelfVerifyFailed,
+    Server,
 };
 use sha2::Sha256;
 use strata_bridge_primitives::{scripts::taproot::TaprootWitness, secp::EvenSecretKey};
+use terrors::OneOf;
+use tokio::sync::Mutex;
 
 use super::paths::{MUSIG2_KEY_PATH, MUSIG2_NONCE_IKM_PATH};
 
@@ -30,6 +40,63 @@ pub struct Ms2Signer {
 
     /// Initial key material to derive secret nonces.
     ikm: [u8; 32],
+}
+
+const SECNONCE_CACHE_CAPACITY: usize = 512;
+const SECNONCE_CACHE_ENTRY_PCT: u8 = 10;
+const SECNONCE_CACHE_REALLOC_THRESHOLD: usize = 64;
+
+static SECNONCE_CACHE: LazyLock<Mutex<SecNonceCache>> = LazyLock::new(|| {
+    Mutex::new(SecNonceCache::new(
+        SECNONCE_CACHE_CAPACITY,
+        SECNONCE_CACHE_ENTRY_PCT,
+        RandomState::new(),
+    ))
+});
+
+struct SecNonceCache<S = RandomState>
+where
+    S: BuildHasher,
+{
+    cache: HashMap<u64, SecNonce>,
+    advisor: CacheAdvisor,
+    hash_builder: S,
+}
+
+impl<S> SecNonceCache<S>
+where
+    S: BuildHasher,
+{
+    fn new(capacity: usize, entry_pct: u8, hash_builder: S) -> Self {
+        Self {
+            cache: HashMap::with_capacity(capacity),
+            advisor: CacheAdvisor::new(capacity, entry_pct),
+            hash_builder,
+        }
+    }
+
+    fn get(
+        &mut self,
+        params: &Musig2Params,
+        create: impl FnOnce(&Musig2Params) -> Result<SecNonce, OurPubKeyIsNotInParams>,
+    ) -> Result<SecNonce, OurPubKeyIsNotInParams> {
+        let hash = self.hash_builder.hash_one(params);
+        if let Some(nonce) = self.cache.get(&hash) {
+            Ok(nonce.clone())
+        } else {
+            let nonce = create(params)?;
+            let eviction_list = self.advisor.accessed_reuse_buffer(hash, 1);
+            for (id_to_evict, _) in eviction_list {
+                self.cache.remove(id_to_evict);
+            }
+
+            if eviction_list.len() > SECNONCE_CACHE_REALLOC_THRESHOLD {
+                self.advisor.reset_internal_access_buffer();
+            }
+            self.cache.insert(hash, nonce.clone());
+            Ok(nonce)
+        }
+    }
 }
 
 impl Ms2Signer {
@@ -49,29 +116,17 @@ impl Ms2Signer {
             ikm,
         }
     }
-}
 
-impl Musig2Signer<Server, ServerFirstRound> for Ms2Signer {
-    async fn new_session(
-        &self,
-        ordered_pubkeys: Vec<XOnlyPublicKey>,
-        witness: TaprootWitness,
-        input_txid: Txid,
-        input_vout: u32,
-    ) -> Result<ServerFirstRound, SignerIdxOutOfBounds> {
-        let my_pub_key = self.kp.x_only_public_key().0;
-        let signer_index = ordered_pubkeys
-            .iter()
-            .position(|pk| pk == &my_pub_key)
-            .ok_or(SignerIdxOutOfBounds {
-                index: usize::MAX,
-                n_signers: usize::MAX,
-            })?;
-        let mut ctx =
-            KeyAggContext::new(ordered_pubkeys.iter().map(|pk| pk.public_key(Parity::Even)))
-                .unwrap();
+    fn key_agg_ctx(params: &Musig2Params) -> KeyAggContext {
+        let mut ctx = KeyAggContext::new(
+            params
+                .ordered_pubkeys
+                .iter()
+                .map(|pk| pk.public_key(Parity::Even)),
+        )
+        .unwrap();
 
-        match witness {
+        match params.witness {
             TaprootWitness::Key => {
                 ctx = ctx
                     .with_unspendable_taproot_tweak()
@@ -84,144 +139,102 @@ impl Musig2Signer<Server, ServerFirstRound> for Ms2Signer {
             }
             _ => {}
         }
+        ctx
+    }
 
-        let nonce_seed = {
-            let info = make_buf! {
-                (&input_txid.as_raw_hash().to_byte_array(), 32),
-                (&input_vout.to_le_bytes(), 4)
+    async fn sec_nonce(
+        &self,
+        params: &Musig2Params,
+        key_agg_ctx: &KeyAggContext,
+    ) -> Result<SecNonce, OurPubKeyIsNotInParams> {
+        SECNONCE_CACHE.lock().await.get(params, |params| {
+            let nonce_seed = {
+                let info = make_buf! {
+                    (&params.input.txid.as_raw_hash().to_byte_array(), 32),
+                    (&params.input.vout.to_le_bytes(), 4)
+                };
+                let hk = Hkdf::<Sha256>::new(None, &self.ikm);
+                let mut output = [0u8; 32];
+                hk.expand(&info, &mut output)
+                    .expect("32 is a valid length for Sha256 to output");
+                output
             };
-            let hk = Hkdf::<Sha256>::new(None, &self.ikm);
-            let mut okm = [0u8; 32];
-            hk.expand(&info, &mut okm)
-                .expect("32 is a valid length for Sha256 to output");
-            okm
-        };
 
-        let first_round = FirstRound::new(
-            ctx,
-            nonce_seed,
-            signer_index,
-            SecNonceSpices::new().with_seckey(self.kp.secret_key()),
-        )
-        .map_err(|e| SignerIdxOutOfBounds {
-            index: e.index,
-            n_signers: e.n_signers,
-        })?;
-        Ok(ServerFirstRound {
-            first_round,
-            ordered_public_keys: ordered_pubkeys,
-            seckey: self.kp.secret_key(),
+            let our_signer_idx = params
+                .ordered_pubkeys
+                .iter()
+                .position(|pk| pk == &self.kp.x_only_public_key().0)
+                .ok_or(OurPubKeyIsNotInParams)?;
+
+            let secnonce = SecNonce::build(nonce_seed)
+                .with_pubkey(self.kp.public_key())
+                .with_aggregated_pubkey(key_agg_ctx.aggregated_pubkey::<Point>())
+                .with_extra_input(&(our_signer_idx as u32).to_be_bytes())
+                .with_spices(SecNonceSpices::new().with_seckey(self.kp.secret_key()))
+                .build();
+            Ok(secnonce)
         })
+    }
+}
+
+impl Musig2Signer<Server> for Ms2Signer {
+    async fn get_pub_nonce(
+        &self,
+        params: Musig2Params,
+    ) -> Result<PubNonce, OurPubKeyIsNotInParams> {
+        let key_agg_ctx = Self::key_agg_ctx(&params);
+        self.sec_nonce(&params, &key_agg_ctx)
+            .await
+            .map(|sn| sn.public_nonce())
+    }
+
+    async fn get_our_partial_sig(
+        &self,
+        params: Musig2Params,
+        aggnonce: AggNonce,
+        message: [u8; 32],
+    ) -> Result<PartialSignature, OneOf<(OurPubKeyIsNotInParams, SelfVerifyFailed)>> {
+        let key_agg_ctx = Self::key_agg_ctx(&params);
+        let secnonce = self
+            .sec_nonce(&params, &key_agg_ctx)
+            .await
+            .map_err(OneOf::new)?;
+        let partial_signature = match musig2::adaptor::sign_partial::<PartialSignature>(
+            &key_agg_ctx,
+            self.kp.secret_key(),
+            secnonce,
+            &aggnonce,
+            MaybePoint::Infinity,
+            message,
+        ) {
+            Ok(ps) => ps,
+            Err(SigningError::UnknownKey) => {
+                unreachable!("we checked if our key is included when building secnonce")
+            }
+            Err(SigningError::SelfVerifyFail) => return Err(OneOf::new(SelfVerifyFailed)),
+        };
+        Ok(partial_signature)
+    }
+}
+
+impl SchnorrSigner<Server> for Ms2Signer {
+    async fn sign(
+        &self,
+        digest: &[u8; 32],
+        tweak: Option<TapNodeHash>,
+    ) -> <Server as Origin>::Container<Signature> {
+        self.kp
+            .tap_tweak(SECP256K1, tweak)
+            .to_keypair()
+            .sign_schnorr(Message::from_digest_slice(digest).expect("digest is 32 bytes"))
+    }
+
+    async fn sign_no_tweak(&self, digest: &[u8; 32]) -> <Server as Origin>::Container<Signature> {
+        self.kp
+            .sign_schnorr(Message::from_digest_slice(digest).expect("digest is exactly 32 bytes"))
     }
 
     async fn pubkey(&self) -> <Server as Origin>::Container<XOnlyPublicKey> {
         self.kp.x_only_public_key().0
-    }
-}
-
-/// First round of the MuSig2 protocol for the server.
-#[allow(missing_debug_implementations)]
-pub struct ServerFirstRound {
-    /// The first round of the MuSig2 protocol.
-    first_round: FirstRound,
-
-    /// Ordered X-only public keys of the signers.
-    ordered_public_keys: Vec<XOnlyPublicKey>,
-
-    /// Operator's [`SecretKey`].
-    seckey: SecretKey,
-}
-
-impl Musig2SignerFirstRound<Server, ServerSecondRound> for ServerFirstRound {
-    async fn our_nonce(&self) -> <Server as Origin>::Container<musig2::PubNonce> {
-        self.first_round.our_public_nonce()
-    }
-
-    async fn holdouts(&self) -> <Server as Origin>::Container<Vec<XOnlyPublicKey>> {
-        self.first_round
-            .holdouts()
-            .iter()
-            .map(|idx| self.ordered_public_keys[*idx])
-            .collect()
-    }
-
-    async fn is_complete(&self) -> <Server as Origin>::Container<bool> {
-        self.first_round.is_complete()
-    }
-
-    async fn receive_pub_nonce(
-        &mut self,
-        pubkey: XOnlyPublicKey,
-        pubnonce: musig2::PubNonce,
-    ) -> <Server as Origin>::Container<Result<(), RoundContributionError>> {
-        let signer_idx = self
-            .ordered_public_keys
-            .iter()
-            .position(|x| x == &pubkey)
-            .ok_or(RoundContributionError::out_of_range(0, 0))?;
-        self.first_round.receive_nonce(signer_idx, pubnonce)
-    }
-
-    async fn finalize(
-        self,
-        hash: [u8; 32],
-    ) -> <Server as Origin>::Container<Result<ServerSecondRound, RoundFinalizeError>> {
-        self.first_round
-            .finalize(self.seckey, hash)
-            .map(|sr| ServerSecondRound {
-                second_round: sr,
-                ordered_public_keys: self.ordered_public_keys,
-            })
-    }
-}
-
-/// Second round of the MuSig2 protocol for the server.
-#[allow(missing_debug_implementations)]
-pub struct ServerSecondRound {
-    /// The second round of the MuSig2 protocol.
-    second_round: SecondRound<[u8; 32]>,
-
-    /// Ordered X-only public keys of the signers.
-    ordered_public_keys: Vec<XOnlyPublicKey>,
-}
-
-impl Musig2SignerSecondRound<Server> for ServerSecondRound {
-    async fn agg_nonce(&self) -> <Server as Origin>::Container<musig2::AggNonce> {
-        self.second_round.aggregated_nonce().clone()
-    }
-
-    async fn holdouts(&self) -> <Server as Origin>::Container<Vec<XOnlyPublicKey>> {
-        self.second_round
-            .holdouts()
-            .iter()
-            .map(|idx| self.ordered_public_keys[*idx])
-            .collect()
-    }
-
-    async fn our_signature(&self) -> <Server as Origin>::Container<musig2::PartialSignature> {
-        self.second_round.our_signature()
-    }
-
-    async fn is_complete(&self) -> <Server as Origin>::Container<bool> {
-        self.second_round.is_complete()
-    }
-
-    async fn receive_signature(
-        &mut self,
-        pubkey: XOnlyPublicKey,
-        signature: musig2::PartialSignature,
-    ) -> <Server as Origin>::Container<Result<(), RoundContributionError>> {
-        let signer_idx = self
-            .ordered_public_keys
-            .iter()
-            .position(|x| x == &pubkey)
-            .ok_or(RoundContributionError::out_of_range(0, 0))?;
-        self.second_round.receive_signature(signer_idx, signature)
-    }
-
-    async fn finalize(
-        self,
-    ) -> <Server as Origin>::Container<Result<LiftedSignature, RoundFinalizeError>> {
-        self.second_round.finalize()
     }
 }

@@ -3,7 +3,7 @@
 //! This transaction is used to prevent an operator from getting the bridge funds using historical
 //! claims even _after_ their stake has been slashed.
 
-use bitcoin::{sighash::Prevouts, Amount, Network, OutPoint, Psbt, Transaction, TxOut, Txid};
+use bitcoin::{Network, OutPoint, Psbt, TapSighashType, Transaction, TxOut, Txid};
 use bitcoin_bosd::Descriptor;
 use strata_bridge_connectors::prelude::{ConnectorP, StakeSpendPath};
 use strata_bridge_primitives::{
@@ -13,8 +13,6 @@ use strata_bridge_primitives::{
         taproot::TaprootWitness,
     },
 };
-
-use super::prelude::CovenantTx;
 
 /// The data required to create a [`BurnPayoutsTx`].
 #[derive(Debug, Clone)]
@@ -35,11 +33,8 @@ pub struct BurnPayoutsTx {
     /// The psbt that contains the inputs and outputs for the transaction.
     psbt: Psbt,
 
-    /// The prevouts that are being spent in the transaction.
-    prevouts: Vec<TxOut>,
-
     /// The witnesses for the transaction used to spend a taproot output.
-    witnesses: Vec<TaprootWitness>,
+    witnesses: [TaprootWitness; 1],
 }
 
 impl BurnPayoutsTx {
@@ -62,20 +57,36 @@ impl BurnPayoutsTx {
         };
 
         psbt.inputs[0].witness_utxo = Some(prevout.clone());
+        psbt.inputs[0].sighash_type = Some(TapSighashType::Default.into());
 
         let (hashlock_script, control_block) = hashlock_connector.generate_spend_info();
 
-        let witnesses = vec![TaprootWitness::Script {
+        let witnesses = [TaprootWitness::Script {
             script_buf: hashlock_script,
             control_block,
         }];
-        let prevouts = vec![prevout];
 
-        Self {
-            psbt,
-            prevouts,
-            witnesses,
-        }
+        Self { psbt, witnesses }
+    }
+
+    /// The underlying PSBT.
+    pub const fn psbt(&self) -> &Psbt {
+        &self.psbt
+    }
+
+    /// A mutable reference to the underlying PSBT.
+    pub const fn psbt_mut(&mut self) -> &mut Psbt {
+        &mut self.psbt
+    }
+
+    /// The witnesses required to spend this transaction as per BIP-341.
+    pub const fn witnesses(&self) -> &[TaprootWitness; 1] {
+        &self.witnesses
+    }
+
+    /// Computes the txid of the transaction.
+    pub fn compute_txid(&self) -> Txid {
+        self.psbt.unsigned_tx.compute_txid()
     }
 
     /// Finalizes the transaction with the preimage for the hashlock.
@@ -90,33 +101,6 @@ impl BurnPayoutsTx {
         self.psbt
             .extract_tx()
             .expect("transaction must be finalized")
-    }
-}
-
-impl CovenantTx for BurnPayoutsTx {
-    fn psbt(&self) -> &Psbt {
-        &self.psbt
-    }
-
-    fn psbt_mut(&mut self) -> &mut Psbt {
-        &mut self.psbt
-    }
-
-    fn prevouts(&self) -> Prevouts<'_, TxOut> {
-        const INPUT_INDEX: usize = 0;
-        Prevouts::One(INPUT_INDEX, self.prevouts[INPUT_INDEX].clone())
-    }
-
-    fn witnesses(&self) -> &[TaprootWitness] {
-        &self.witnesses
-    }
-
-    fn input_amount(&self) -> Amount {
-        self.prevouts.iter().map(|txout| txout.value).sum()
-    }
-
-    fn compute_txid(&self) -> Txid {
-        self.psbt.unsigned_tx.compute_txid()
     }
 }
 
@@ -139,7 +123,7 @@ mod tests {
     fn test_burn_payouts_tx() {
         let mut conf = Conf::default();
         conf.args.push("-txindex=1");
-        let bitcoind = Node::from_downloaded_with_conf(&conf).unwrap();
+        let bitcoind = Node::with_conf("bitcoind", &conf).unwrap();
         let btc_client = &bitcoind.client;
 
         let network = btc_client.get_blockchain_info().unwrap().chain;

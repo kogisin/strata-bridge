@@ -134,8 +134,8 @@ mod tests {
             p2p = ["02e68354ebb3ef14caeac8f724fea1449d802133495ef1675f210b07421700a386", "03f79465fcc3ef14caeac8f724fea1449d802133495ef1675f210b07421811b497"]
 
             [tx_graph]
-            tag = "bridge-tag"
-            deposit_amount = {0}
+            tag = "alpn"
+            deposit_amount = {deposit_amount}
             operator_fee = 1_000_000
             challenge_cost = 10_000_000
             refund_delay = 1_008
@@ -152,7 +152,7 @@ mod tests {
             payout_timelock = 1_008
 
             [sidesystem]
-            rollup_name = "alpen-bridge"
+            rollup_name = "alpn"
             block_time = 1_000
             da_tag = "alpen-bridge-da"
             checkpoint_tag = "alpen-bridge-checkpoint"
@@ -165,14 +165,13 @@ mod tests {
             l1_reorg_safe_depth = 1_000
             target_l2_batch_size = 1_000
             address_length = 20
-            deposit_amount = {0}
+            deposit_amount = {deposit_amount}
             rollup_vk.native = "0x0000000000000000000000000000000000000000000000000000000000000000"
             dispatch_assignment_dur = 1000
             proof_publish_mode = "strict"
             max_deposits_in_block = 20
             network = "signet"
         "#,
-            deposit_amount
         );
 
         let deserialized = toml::from_str::<Params>(&params);

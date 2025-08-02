@@ -4,18 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [lints]
-rust.missing_debug_implementations = "warn"
-rust.rust_2018_idioms = { level = "deny", priority = -1 }
-rust.unreachable_pub = "warn"
-rust.unused_crate_dependencies = "deny"
-rust.unused_must_use = "deny"
+workspace = true
 
 [dependencies]
 strata-bridge-primitives.workspace = true
-strata-btcio.workspace = true
+
+strata-primitives.workspace = true
 
 arbitrary.workspace = true
 bitcoin.workspace = true
+bitcoind-async-client.workspace = true
 bitvm.workspace = true
 corepc-node.workspace = true
 hex.workspace = true
@@ -23,5 +21,8 @@ musig2.workspace = true
 rand_core = { version = "0.9.1", default-features = false, features = [
   "os_rng",
 ] }
+secp256k1.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

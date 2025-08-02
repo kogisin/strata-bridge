@@ -1,3 +1,5 @@
+//! Constructs the slash stake transaction.
+
 use alpen_bridge_params::prelude::StakeChainParams;
 use bitcoin::{
     psbt::PsbtSighashType, sighash::Prevouts, taproot, Amount, Network, OutPoint, Psbt,
@@ -6,12 +8,13 @@ use bitcoin::{
 use secp256k1::schnorr;
 use strata_bridge_connectors::prelude::{ConnectorNOfN, ConnectorStake, StakeSpendPath};
 use strata_bridge_primitives::{
-    constants::{SEGWIT_MIN_AMOUNT, UNSPENDABLE_INTERNAL_KEY},
+    constants::SEGWIT_MIN_AMOUNT,
     scripts::{
         prelude::{create_tx, create_tx_ins},
         taproot::{create_taproot_addr, SpendPath, TaprootWitness},
     },
 };
+use strata_primitives::constants::UNSPENDABLE_PUBLIC_KEY;
 
 use super::prelude::CovenantTx;
 
@@ -28,6 +31,9 @@ pub struct SlashStakeData {
     pub network: Network,
 }
 
+/// The number of inputs that require an $N$-of-$N$ signature in the [`SlashStakeTx`].
+pub const NUM_SLASH_STAKE_INPUTS: usize = 2;
+
 /// The transaction used to slash an operator's stake.
 ///
 /// The purpose of this transaction is to penalize advancing the stake chain without having fully
@@ -36,9 +42,9 @@ pub struct SlashStakeData {
 pub struct SlashStakeTx {
     psbt: Psbt,
 
-    prevouts: Vec<TxOut>,
+    prevouts: [TxOut; NUM_SLASH_STAKE_INPUTS],
 
-    witnesses: Vec<TaprootWitness>,
+    witnesses: [TaprootWitness; NUM_SLASH_STAKE_INPUTS],
 }
 
 impl SlashStakeTx {
@@ -59,7 +65,7 @@ impl SlashStakeTx {
         let (burn_address, _) = create_taproot_addr(
             &data.network,
             SpendPath::KeySpend {
-                internal_key: *UNSPENDABLE_INTERNAL_KEY,
+                internal_key: *UNSPENDABLE_PUBLIC_KEY,
             },
         )
         .expect("must be able to create taproot address");
@@ -81,7 +87,7 @@ impl SlashStakeTx {
 
         let claim_out_script = claim_out_conn.create_taproot_address().script_pubkey();
         let claim_out_amount = claim_out_script.minimal_non_dust();
-        let prevouts = vec![
+        let prevouts = [
             TxOut {
                 value: claim_out_amount,
                 script_pubkey: claim_out_script,
@@ -93,7 +99,7 @@ impl SlashStakeTx {
         ];
 
         let tweak = stake_conn.generate_merkle_root();
-        let witnesses = vec![TaprootWitness::Key, TaprootWitness::Tweaked { tweak }];
+        let witnesses = [TaprootWitness::Key, TaprootWitness::Tweaked { tweak }];
 
         psbt.inputs
             .iter_mut()
@@ -110,6 +116,7 @@ impl SlashStakeTx {
         }
     }
 
+    /// Finalizes the transaction.
     pub fn finalize(
         mut self,
         claim_sig: schnorr::Signature,
@@ -141,7 +148,7 @@ impl SlashStakeTx {
     }
 }
 
-impl CovenantTx for SlashStakeTx {
+impl CovenantTx<NUM_SLASH_STAKE_INPUTS> for SlashStakeTx {
     fn psbt(&self) -> &Psbt {
         &self.psbt
     }
@@ -154,7 +161,7 @@ impl CovenantTx for SlashStakeTx {
         Prevouts::All(&self.prevouts)
     }
 
-    fn witnesses(&self) -> &[TaprootWitness] {
+    fn witnesses(&self) -> &[TaprootWitness; 2] {
         &self.witnesses
     }
 
@@ -183,6 +190,7 @@ mod tests {
     };
     use corepc_node::{Conf, Node};
     use secp256k1::rand::{rngs::OsRng, Rng};
+    use strata_bridge_common::logging::{self, LoggerConfig};
     use strata_bridge_connectors::prelude::{ConnectorNOfN, ConnectorStake};
     use strata_bridge_primitives::{
         build_context::{BuildContext, TxBuildContext},
@@ -196,7 +204,6 @@ mod tests {
         musig2::generate_agg_signature,
         prelude::{generate_keypair, get_funding_utxo_exact},
     };
-    use strata_common::logging::{self, LoggerConfig};
     use tracing::info;
 
     use super::{SlashStakeData, SlashStakeTx};
@@ -212,7 +219,7 @@ mod tests {
 
         let mut conf = Conf::default();
         conf.args.push("-txindex=1");
-        let bitcoind = Node::from_downloaded_with_conf(&conf).unwrap();
+        let bitcoind = Node::with_conf("bitcoind", &conf).unwrap();
         let btc_client = &bitcoind.client;
 
         let wallet_addr = btc_client.new_address().unwrap();

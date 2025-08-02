@@ -1,3 +1,5 @@
+//! Scripts for transforming data.
+
 use bitvm::{bigint::U254, pseudo::NMUL, treepp::*};
 
 fn split_digit(window: u32, index: u32) -> Script {
@@ -22,6 +24,7 @@ fn split_digit(window: u32, index: u32) -> Script {
     }
 }
 
+/// Converts a sequence of nibbles to a 254-bit integer.
 pub fn ts_from_nibbles() -> Script {
     script! {
         // [a]
@@ -32,6 +35,7 @@ pub fn ts_from_nibbles() -> Script {
     }
 }
 
+/// Converts a sequence of nibbles to a 254-bit integer.
 pub fn fq_from_nibbles() -> Script {
     const WINDOW: u32 = 4;
     const LIMB_SIZE: u32 = 29;
@@ -39,9 +43,9 @@ pub fn fq_from_nibbles() -> Script {
 
     script! {
         for i in (1..=N_DIGITS).rev() {
-            if (i * WINDOW) % LIMB_SIZE == 0 {
+            if (i * WINDOW).is_multiple_of(LIMB_SIZE) {
                 OP_TOALTSTACK
-            } else if (i * WINDOW) % LIMB_SIZE > 0 &&
+            } else if !(i * WINDOW).is_multiple_of(LIMB_SIZE) &&
                         (i * WINDOW) % LIMB_SIZE < WINDOW {
                 OP_SWAP
                 { split_digit(WINDOW, (i * WINDOW) % LIMB_SIZE) }
@@ -59,6 +63,7 @@ pub fn fq_from_nibbles() -> Script {
     }
 }
 
+/// Flips the nibbles of a byte.
 pub fn flip_byte_nibbles() -> Script {
     script! {
         for i in 1..=4 {
@@ -75,6 +80,7 @@ pub fn flip_byte_nibbles() -> Script {
     }
 }
 
+/// Converts a 256-bit hash to a 254-bit integer.
 pub fn hash_to_bn254_fq() -> Script {
     script! {
         for i in 1..=3 {
@@ -88,25 +94,26 @@ pub fn hash_to_bn254_fq() -> Script {
     }
 }
 
+/// Adds 7 zero bytes to a 32-byte value to handle the bincode serialization.
 pub fn add_bincode_padding_bytes32() -> Script {
     script! {
         for b in [0; 7] { {b} } 32
     }
 }
 
-/// Extracts the committed adta from a WOTS signature.
+/// Extracts the committed data from a WOTS signature.
 ///
 /// It assumes that that the signature consists of a 4-byte checksum that is removed.
 /// The remaining data is assumed to be in the form of nibbles in little-endian order (i.e., the MSB
 /// first). These nibbles are then converted to bytes. Thus, the output has `(TOTAL_SIZE - 4) / 2`
 /// bytes.
 pub fn wots_to_byte_array<const TOTAL_SIZE: usize>(
-    signature: [([u8; 20], u8); TOTAL_SIZE],
+    signature: [[u8; 21]; TOTAL_SIZE],
 ) -> [u8; (TOTAL_SIZE - 4) / 2]
 where
     [(); (TOTAL_SIZE - 4) / 2]:, // must be a multiple of 4 (number of bits in a nibble)
 {
-    let nibs = signature.iter().map(|(_, digit)| *digit);
+    let nibs = signature.iter().map(|sig| *sig.last().unwrap());
     // [MSB, LSB, MSB, LSB, ..., checksum]
     // remove checksum to get [MSB, LSB, MSB, LSB, ...]
     let nibs = nibs.take(TOTAL_SIZE - 4);
@@ -125,15 +132,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::{
-        hashes::{self, Hash},
-        hex::DisplayHex,
-    };
+    use bitcoin::hashes::{self, Hash};
     use bitvm::{
-        signatures::wots_api::{
-            wots256::{self, MSG_LEN},
-            wots_hash, HASH_LEN,
-        },
+        signatures::{Wots, Wots16 as wots_hash, Wots32 as wots256, HASH_LEN},
         treepp::*,
     };
     use secp256k1::rand::{rngs::OsRng, Rng};
@@ -157,10 +158,10 @@ mod tests {
         let secret_str = "test_wots_to_byte_array".to_string();
         let secret = hashes::sha256::Hash::hash(secret_str.as_bytes())
             .to_byte_array()
-            .to_lower_hex_string();
+            .to_vec();
 
-        let message_bytes = OsRng.gen::<[u8; HASH_LEN as usize]>();
-        let signatures = wots_hash::get_signature(&secret, &message_bytes);
+        let message_bytes = OsRng.gen::<[u8; HASH_LEN]>();
+        let signatures = <wots_hash as Wots>::sign(&secret, &message_bytes);
 
         let committed_data = wots_to_byte_array(signatures);
 
@@ -170,8 +171,9 @@ mod tests {
             "committed and extracted hash data must match"
         );
 
-        let message_bytes = OsRng.gen::<[u8; MSG_LEN as usize]>();
-        let signatures = wots256::get_signature(&secret, &message_bytes);
+        const MSG_LEN: usize = wots256::MSG_BYTE_LEN as usize;
+        let message_bytes = OsRng.gen::<[u8; MSG_LEN]>();
+        let signatures = wots256::sign(&secret, &message_bytes);
 
         let committed_data = wots_to_byte_array(signatures);
 

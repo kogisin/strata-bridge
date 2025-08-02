@@ -13,10 +13,16 @@ use tokio::sync::mpsc;
 pub struct Subscription<T> {
     receiver: mpsc::UnboundedReceiver<T>,
 }
+impl<T> Subscription<T> {
+    /// Returns the number of messages in the backlog for this subscription.
+    pub fn backlog(&self) -> usize {
+        self.receiver.len()
+    }
+}
 
 impl<T> Subscription<T> {
     /// Intentionally left private so as not to leak implementation details to consuming APIs.
-    pub(crate) fn from_receiver(receiver: mpsc::UnboundedReceiver<T>) -> Subscription<T> {
+    pub(crate) const fn from_receiver(receiver: mpsc::UnboundedReceiver<T>) -> Subscription<T> {
         Subscription { receiver }
     }
 }

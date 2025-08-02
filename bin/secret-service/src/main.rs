@@ -16,8 +16,24 @@ use colored::Colorize;
 use config::Config;
 use secret_service_server::{run_server, Config as ServerConfig};
 use seeded_impl::Service;
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
 use tls::load_tls;
 use tracing::{info, warn, Level};
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+/// Configures Jemalloc to support memory profiling when the feature is enabled.
+/// This allows us to build flamegraphs for memory usage.
+/// - `prof:true`: enables profiling for memory allocations
+/// - `prof_active:true`: activates the profiling that was enabled by prev option
+/// - `lg_prof_sample:19`: sampling interval of every 1 in 2^19 (~512kib) allocations
+#[cfg(feature = "memory_profiling")]
+#[expect(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 /// Runs the Secret Service in development mode if the `SECRET_SERVICE_DEV` environment variable is
 /// set to `1`.
@@ -26,6 +42,8 @@ pub static DEV_MODE: LazyLock<bool> =
 
 #[tokio::main]
 async fn main() {
+    #[cfg(feature = "memory_profiling")]
+    memory_pprof::setup_memory_profiling(3_000);
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
     if *DEV_MODE {
         warn!("⚠️ DEV_MODE active");

@@ -1,7 +1,10 @@
+//! Errors for the transactions module.
+
 use bitcoin::{psbt::ExtractTxError, Amount, FeeRate, Txid};
 use strata_bridge_primitives::errors::BridgeTxBuilderError;
 use thiserror::Error;
 
+/// Transaction errors.
 #[derive(Debug, Error)]
 pub enum TxError {
     /// Error building the tx.
@@ -10,7 +13,7 @@ pub enum TxError {
 
     /// Failed to finalize a psbt.
     #[error("could not finalize psbt: {0}")]
-    FinalizationFailed(#[from] ExtractTxError),
+    FinalizationFailed(#[from] Box<ExtractTxError>),
 
     /// Insufficient input amount.
     #[error("insufficient input amount, input: {0}, output: {0}")]
@@ -43,4 +46,5 @@ pub enum TxError {
     Unexpected(String),
 }
 
+/// A result type for transaction errors.
 pub type TxResult<T> = Result<T, TxError>;

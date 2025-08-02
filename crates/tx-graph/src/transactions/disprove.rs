@@ -1,13 +1,21 @@
-use alpen_bridge_params::prelude::StakeChainParams;
+//! Constructs the disprove transaction.
+
 use bitcoin::{
     psbt::{ExtractTxError, PsbtSighashType},
     sighash::Prevouts,
     Amount, Network, OutPoint, Psbt, TapSighashType, Transaction, TxOut, Txid,
 };
 use strata_bridge_connectors::prelude::*;
-use strata_bridge_primitives::{constants::*, scripts::prelude::*};
+use strata_bridge_primitives::{
+    constants::{NUM_ASSERT_DATA_TX, SEGWIT_MIN_AMOUNT},
+    scripts::prelude::*,
+};
+use strata_primitives::constants::UNSPENDABLE_PUBLIC_KEY;
 
 use super::covenant_tx::CovenantTx;
+
+/// The index of the post-assert input in the disprove transaction.
+pub const POST_ASSERT_INPUT_INDEX: usize = 1;
 
 /// Data needed to construct a [`DisproveTx`].
 #[derive(Debug, Clone)]
@@ -18,10 +26,6 @@ pub struct DisproveData {
     /// The transaction ID of the deposit transaction.
     pub deposit_txid: Txid,
 
-    /// The stake that remains after deducting all the CPFP dust fees in the preceding
-    /// transactions.
-    pub input_amount: Amount,
-
     /// The [`OutPoint`] of the stake transaction that is being spent.
     pub stake_outpoint: OutPoint,
 
@@ -29,24 +33,37 @@ pub struct DisproveData {
     pub network: Network,
 }
 
+pub(crate) const NUM_DISPROVE_INPUTS: usize = 1;
+
 /// The transaction used to disprove an operator's claim and slash their stake.
+///
+/// Note that this transaction does not contain the second witness as the disprove script is
+/// only known at disprove time.
 #[derive(Debug, Clone)]
 pub struct DisproveTx {
     psbt: Psbt,
 
-    prevouts: Vec<TxOut>,
+    prevouts: [TxOut; 2],
 
-    witnesses: Vec<TaprootWitness>,
+    witnesses: [TaprootWitness; NUM_DISPROVE_INPUTS],
+
+    connector_stake: ConnectorStake,
 }
 
 impl DisproveTx {
     /// Constructs a new instance of the disprove transaction.
     pub fn new(
         data: DisproveData,
-        stake_chain_params: StakeChainParams,
-        connector_a3: ConnectorA3,
+        stake_amount: Amount,
+        burn_amount: Amount,
+        connector_a3: &ConnectorA3,
         connector_stake: ConnectorStake,
     ) -> Self {
+        // This transaction spends the first output from the `PostAssertTx`.
+        // The PostAssertTx has `NUM_ASSERT_DATA_TX` inputs each with `SEGWIT_MIN_AMOUNT`
+        // One of these inputs is used in the CPFP output of the `PostAssertTx` itself.
+        // So, the input (dust) amount for the `DisproveTx` is the following:
+        let input_amount: Amount = SEGWIT_MIN_AMOUNT * (NUM_ASSERT_DATA_TX - 1) as u64;
         let utxos = [
             data.stake_outpoint,
             OutPoint {
@@ -60,12 +77,11 @@ impl DisproveTx {
         let (burn_address, _) = create_taproot_addr(
             &data.network,
             SpendPath::KeySpend {
-                internal_key: *UNSPENDABLE_INTERNAL_KEY,
+                internal_key: *UNSPENDABLE_PUBLIC_KEY,
             },
         )
         .expect("should be able to create taproot address");
         let burn_script = burn_address.script_pubkey();
-        let burn_amount = stake_chain_params.burn_amount;
 
         let tx_outs = create_tx_outs([(burn_script, burn_amount)]);
 
@@ -73,30 +89,29 @@ impl DisproveTx {
 
         let mut psbt = Psbt::from_unsigned_tx(tx).expect("should be able to create psbt");
 
-        let connector_a3_script = connector_a3.generate_locking_script(data.deposit_txid);
+        let connector_a3_script = connector_a3.generate_locking_script();
 
-        let prevouts = vec![
+        let prevouts = [
             TxOut {
-                value: stake_chain_params.stake_amount,
+                value: stake_amount,
                 script_pubkey: connector_stake.generate_address().script_pubkey(),
             },
             TxOut {
-                value: data.input_amount,
+                value: input_amount,
                 script_pubkey: connector_a3_script,
             },
         ];
 
-        let witnesses = vec![
-            TaprootWitness::Tweaked {
-                tweak: connector_stake.generate_merkle_root(),
-            },
-            // witnesses for disprove are only known at disprove time
-        ];
+        let witnesses = [TaprootWitness::Tweaked {
+            tweak: connector_stake.generate_merkle_root(),
+        }];
 
         for (input, utxo) in psbt.inputs.iter_mut().zip(prevouts.clone()) {
             input.witness_utxo = Some(utxo);
+            input.sighash_type = Some(TapSighashType::Default.into());
         }
 
+        // update the sighash type on the first input.
         psbt.inputs[0].sighash_type = Some(PsbtSighashType::from(TapSighashType::Single));
 
         Self {
@@ -104,6 +119,8 @@ impl DisproveTx {
 
             prevouts,
             witnesses,
+
+            connector_stake,
         }
     }
 
@@ -113,10 +130,10 @@ impl DisproveTx {
         reward: TxOut,
         stake_path: StakeSpendPath,
         disprove_leaf: ConnectorA3Leaf,
-        connector_s: ConnectorStake,
         connector_a3: ConnectorA3,
     ) -> Transaction {
-        connector_s.finalize_input(&mut self.psbt.inputs[0], stake_path);
+        self.connector_stake
+            .finalize_input(&mut self.psbt.inputs[0], stake_path);
         connector_a3.finalize_input(&mut self.psbt.inputs[1], disprove_leaf);
 
         let tx = self.psbt.extract_tx();
@@ -132,7 +149,7 @@ impl DisproveTx {
             // include the actual transaction which in the case of `DisproveTx` is too big.
             Err(e) => match e {
                 ExtractTxError::AbsurdFeeRate { fee_rate, .. } => {
-                    panic!("absured fee rate: {}", fee_rate);
+                    panic!("absured fee rate: {fee_rate}");
                 }
                 ExtractTxError::MissingInputValue { .. } => {
                     panic!("missing input value");
@@ -149,20 +166,17 @@ impl DisproveTx {
                         .iter()
                         .map(|o| o.value)
                         .sum::<Amount>();
-                    panic!(
-                        "sending too much: input({}) < output({})",
-                        input_amount, output_amount
-                    );
+                    panic!("sending too much: input({input_amount}) < output({output_amount})",);
                 }
                 unexpected_err => {
-                    panic!("unexpected error: {:?}", unexpected_err);
+                    panic!("unexpected error: {unexpected_err:?}");
                 }
             },
         }
     }
 }
 
-impl CovenantTx for DisproveTx {
+impl CovenantTx<NUM_DISPROVE_INPUTS> for DisproveTx {
     fn psbt(&self) -> &Psbt {
         &self.psbt
     }
@@ -175,7 +189,7 @@ impl CovenantTx for DisproveTx {
         Prevouts::All(&self.prevouts)
     }
 
-    fn witnesses(&self) -> &[TaprootWitness] {
+    fn witnesses(&self) -> &[TaprootWitness; 1] {
         &self.witnesses
     }
 

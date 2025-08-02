@@ -1,7 +1,9 @@
 //! Types for the RPC server.
 
-use bitcoin::Txid;
+use bitcoin::{hashes::sha256, secp256k1::XOnlyPublicKey, taproot, OutPoint, Txid};
 use serde::{Deserialize, Serialize};
+use strata_bridge_primitives::{types::OperatorIdx, wots};
+use strata_primitives::buf::Buf32;
 
 /// Enum representing the status of a bridge operator
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,25 +22,16 @@ pub enum RpcOperatorStatus {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RpcDepositStatus {
     /// Deposit exists, but minting hasn't happened yet.
-    InProgress {
-        /// Transaction ID of the deposit request transaction (DRT).
-        deposit_request_txid: Txid,
-    },
+    InProgress,
 
     /// Deposit exists, but was never completed (can be reclaimed).
     Failed {
-        /// Transaction ID of the deposit request transaction (DRT).
-        deposit_request_txid: Txid,
-
         /// Reason for the failure.
         failure_reason: String,
     },
 
     /// Deposit has been fully processed and minted.
     Complete {
-        /// Transaction ID of the deposit request transaction (DRT).
-        deposit_request_txid: Txid,
-
         /// Transaction ID of the deposit transaction (DT).
         deposit_txid: Txid,
     },
@@ -76,6 +69,9 @@ pub enum RpcWithdrawalStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RpcReimbursementStatus {
+    /// Claim does not exist.
+    NotStarted,
+
     /// Claim exists, challenge step is "Claim", no payout.
     InProgress {
         /// Challenge step.
@@ -93,7 +89,7 @@ pub enum RpcReimbursementStatus {
 
     /// Claim has been successfully reimbursed.
     Complete {
-        /// Transaction ID of the payout transaction.
+        /// Payout transaction ID.
         payout_txid: Txid,
     },
 }
@@ -103,6 +99,9 @@ pub enum RpcReimbursementStatus {
 pub struct RpcDepositInfo {
     /// Status of the deposit.
     pub status: RpcDepositStatus,
+
+    /// Transaction ID of the deposit request transaction (DRT).
+    pub deposit_request_txid: Txid,
 }
 
 /// Represents withdrawal transaction details
@@ -110,6 +109,12 @@ pub struct RpcDepositInfo {
 pub struct RpcWithdrawalInfo {
     /// Status of the withdrawal.
     pub status: RpcWithdrawalStatus,
+
+    /// Transaction ID of the withdrawal request transaction (WRT).
+    ///
+    /// NOTE: This is not a Bitcoin [`Txid`] but a [`Buf32`] representing the transaction ID of the
+    /// withdrawal transaction in the sidesystem's execution environment.
+    pub withdrawal_request_txid: Buf32,
 }
 
 /// Represents reimbursement transaction details
@@ -120,4 +125,52 @@ pub struct RpcClaimInfo {
 
     /// Status of the reimbursement.
     pub status: RpcReimbursementStatus,
+}
+
+/// Represents a valid bridge duty status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RpcBridgeDutyStatus {
+    /// Deposit duty
+    Deposit {
+        /// Transaction ID of the deposit request transaction (DRT).
+        deposit_request_txid: Txid,
+    },
+
+    /// Withdrawal duty
+    Withdrawal {
+        /// Transaction ID of the withdrawal request transaction (WRT).
+        ///
+        /// NOTE: This is not a Bitcoin [`Txid`] but a [`Buf32`] representing the transaction ID of
+        /// the withdrawal transaction in the sidesystem's execution environment.
+        withdrawal_request_txid: Buf32,
+
+        /// Assigned operator index.
+        assigned_operator_idx: OperatorIdx,
+    },
+}
+
+/// The data shared during deposit setup required to construct a disprove transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcDisproveData {
+    /// The transaction ID of the post-assert transaction.
+    pub post_assert_txid: Txid,
+
+    /// The transaction ID of the deposit transaction.
+    pub deposit_txid: Txid,
+
+    /// The outpoint of the stake transaction that is being spent.
+    pub stake_outpoint: OutPoint,
+
+    /// The hash for the hashlock in the stake transaction.
+    pub stake_hash: sha256::Hash,
+
+    /// The operator key that locks the stake transaction.
+    pub operator_pubkey: XOnlyPublicKey,
+
+    /// The WOTS public keys whose private keys were used by the operator to sign their proof
+    /// assertions.
+    pub wots_public_keys: wots::PublicKeys,
+
+    /// The N-of-N signature used to finalize the first input in the disprove transaction.
+    pub n_of_n_sig: taproot::Signature,
 }

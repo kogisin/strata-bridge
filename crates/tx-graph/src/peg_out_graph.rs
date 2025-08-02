@@ -1,27 +1,20 @@
 //! This module constructs the peg-out graph which is a series of transactions that allow for the
 //! withdrawal of funds from the bridge address given a valid claim.
 
-use core::fmt;
-use std::{marker::PhantomData, mem::MaybeUninit};
+use std::time::Instant;
 
 use alpen_bridge_params::{connectors::*, prelude::StakeChainParams, tx_graph::PegOutGraphParams};
-use bitcoin::{hashes::sha256, relative, OutPoint, Txid};
-use secp256k1::XOnlyPublicKey;
-use serde::{
-    de::{SeqAccess, Visitor},
-    ser::SerializeTuple,
-    Deserialize, Deserializer, Serialize, Serializer,
-};
+use bitcoin::{hashes::sha256, relative, OutPoint, TapSighashType, Txid};
+use secp256k1::{Message, XOnlyPublicKey};
+use serde::{Deserialize, Serialize};
 use strata_bridge_connectors::prelude::*;
 use strata_bridge_primitives::{
-    build_context::BuildContext,
-    constants::*,
-    wots::{self, Groth16PublicKeys},
+    build_context::BuildContext, constants::*, scripts::taproot::TaprootWitness, wots,
 };
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::{
-    errors::TxGraphResult,
+    pog_musig_functor::PogMusigF,
     transactions::{
         payout_optimistic::{PayoutOptimisticData, PayoutOptimisticTx},
         prelude::*,
@@ -33,7 +26,7 @@ use crate::{
 ///
 /// This data is shared between various operators and verifiers and is used to construct the peg out
 /// graph deterministically.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PegOutGraphInput {
     /// The [`OutPoint`] of the stake transaction
     pub stake_outpoint: OutPoint,
@@ -58,7 +51,7 @@ pub struct PegOutGraphInput {
 
 /// The minimum necessary information to recognize all of the relevant transactions in a given
 /// [`PegOutGraph`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PegOutGraphSummary {
     /// Txid of the stake transaction that this graph is associated with.
     pub stake_txid: Txid,
@@ -87,94 +80,6 @@ pub struct PegOutGraphSummary {
     pub slash_stake_txids: Vec<Txid>,
 }
 
-/// This is needed because the blanket implementation of serde's deserializers doesn't go past fixed
-/// length arrays of larger than 32.
-fn serialize_assert_vector<T: Serialize, S: Serializer>(
-    data: &[T; NUM_ASSERT_DATA_TX],
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    let mut seq = serializer.serialize_tuple(NUM_ASSERT_DATA_TX)?;
-    for e in data {
-        seq.serialize_element(e)?;
-    }
-    seq.end()
-}
-
-/// This is needed because the blanket implementation of serde's deserializers doesn't go past fixed
-/// length arrays of larger than 32.
-fn deserialize_assert_vector<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
-    deserializer: D,
-) -> Result<[T; NUM_ASSERT_DATA_TX], D::Error> {
-    // THE AUTHORS OF SERDE CAN BURN IN HELL. Seriously whoever thought of serde's design is fucking
-    // retarded.
-    struct AssertVisitor<const N: usize, T> {
-        marker: PhantomData<T>,
-    }
-
-    impl<'de, const N: usize, T> Visitor<'de> for AssertVisitor<N, T>
-    where
-        T: Deserialize<'de>,
-    {
-        type Value = [T; N];
-
-        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-            formatter.write_str("a sequence")
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: SeqAccess<'de>,
-        {
-            let mut values = [const { MaybeUninit::<T>::uninit() }; N];
-            let mut num_successfully_deserialized = 0;
-
-            let cleanup = |mut vs: [MaybeUninit<T>; N], n: usize| {
-                for written in &mut vs[..n] {
-                    unsafe {
-                        written.assume_init_drop();
-                    }
-                }
-            };
-
-            while let Some(res) = seq.next_element().transpose() {
-                match res {
-                    Ok(value) => {
-                        if num_successfully_deserialized >= NUM_ASSERT_DATA_TX {
-                            cleanup(values, num_successfully_deserialized);
-                            return Err(serde::de::Error::invalid_length(
-                                num_successfully_deserialized + 1,
-                                &self,
-                            ));
-                        }
-
-                        values[num_successfully_deserialized].write(value);
-                        num_successfully_deserialized += 1;
-                    }
-                    Err(e) => {
-                        cleanup(values, num_successfully_deserialized);
-                        return Err(e);
-                    }
-                }
-            }
-
-            if num_successfully_deserialized < NUM_ASSERT_DATA_TX {
-                cleanup(values, num_successfully_deserialized);
-                Err(serde::de::Error::invalid_length(
-                    num_successfully_deserialized,
-                    &self,
-                ))
-            } else {
-                Ok(unsafe { MaybeUninit::array_assume_init(values) })
-            }
-        }
-    }
-
-    let visitor = AssertVisitor::<NUM_ASSERT_DATA_TX, T> {
-        marker: PhantomData,
-    };
-    deserializer.deserialize_seq(visitor)
-}
-
 /// A container for the transactions in the peg-out graph.
 ///
 /// Each transaction is a wrapper around [`bitcoin::Psbt`] and some auxiliary data required to
@@ -183,6 +88,9 @@ fn deserialize_assert_vector<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
 pub struct PegOutGraph {
     /// The claim transaction that commits to a valid withdrawal fulfillment txid.
     pub claim_tx: ClaimTx,
+
+    /// The transaction used to challenge an operator's claim.
+    pub challenge_tx: ChallengeTx,
 
     /// The transaction used to reimburse operators when no challenge occurs.
     pub payout_optimistic: PayoutOptimisticTx,
@@ -226,21 +134,21 @@ impl PegOutGraph {
     /// * `prev_claim_txids` - The transaction IDs of the previous claim transactions that can be
     ///   used to slash the operator's stake in case of a faulty advancement of the stake chain
     ///   i.e., if the operator advances the stake chain without fully executing the previous
-    ///   claims.In general, the number of these transactions should be `min(deposit_index,
+    ///   claims. In general, the number of these transactions should be `min(deposit_index,
     ///   slash_stake_count)` (assuming that the deposit index is zero-indexed). As an optimization,
     ///   only claim txids corresponding to unclaimed deposits need to be specified.
-    pub fn generate<Context>(
-        input: PegOutGraphInput,
-        context: &Context,
+    pub fn generate(
+        input: &PegOutGraphInput,
+        context: &impl BuildContext,
         deposit_txid: Txid,
         graph_params: PegOutGraphParams,
         connector_params: ConnectorParams,
         stake_chain_params: StakeChainParams,
         prev_claim_txids: Vec<Txid>,
-    ) -> TxGraphResult<(Self, PegOutGraphConnectors)>
-    where
-        Context: BuildContext,
-    {
+    ) -> (Self, PegOutGraphConnectors) {
+        let total_start_time = Instant::now();
+
+        let start_time = Instant::now();
         let connectors = PegOutGraphConnectors::new(
             context,
             deposit_txid,
@@ -248,26 +156,38 @@ impl PegOutGraph {
             input.operator_pubkey,
             input.stake_hash,
             stake_chain_params.delta,
-            input.wots_public_keys,
+            input.wots_public_keys.clone(),
         );
 
         let claim_data = ClaimData {
             stake_outpoint: input.withdrawal_fulfillment_outpoint,
-            input_amount: FUNDING_AMOUNT,
             deposit_txid,
         };
 
         let claim_tx = ClaimTx::new(
             claim_data,
-            connectors.kickoff,
+            connectors.kickoff.clone(),
             connectors.claim_out_0,
             connectors.claim_out_1,
             connectors.n_of_n,
             connectors.connector_cpfp,
         );
         let claim_txid = claim_tx.compute_txid();
-        debug!(event = "created claim tx", %claim_txid);
+        let time_taken = start_time.elapsed();
+        debug!(event = "created claim tx", %claim_txid, ?time_taken);
+        let start_time = Instant::now();
 
+        let challenge_input = ChallengeTxInput {
+            claim_outpoint: OutPoint::new(claim_txid, CHALLENGE_VOUT),
+            challenge_amt: graph_params.challenge_cost,
+            operator_pubkey: input.operator_pubkey,
+            network: context.network(),
+        };
+        let challenge_tx = ChallengeTx::new(challenge_input, connectors.claim_out_1);
+        let time_taken = start_time.elapsed();
+        debug!(event = "created challenge tx", ?time_taken);
+
+        let start_time = Instant::now();
         let payout_optimistic_data = PayoutOptimisticData {
             claim_txid,
             deposit_txid,
@@ -275,7 +195,6 @@ impl PegOutGraph {
                 txid: input.stake_outpoint.txid,
                 vout: 1,
             },
-            input_amount: claim_tx.output_amount(),
             deposit_amount: graph_params.deposit_amount,
             operator_key: input.operator_pubkey,
             network: context.network(),
@@ -289,12 +208,12 @@ impl PegOutGraph {
             connectors.hashlock_payout,
             connectors.connector_cpfp,
         );
+        let time_taken = start_time.elapsed();
+        debug!(event = "created payout optimistic tx", ?time_taken);
 
+        let start_time = Instant::now();
         let assert_chain_data = AssertChainData {
-            pre_assert_data: PreAssertData {
-                claim_txid,
-                input_amount: claim_tx.output_amount(),
-            },
+            pre_assert_data: PreAssertData { claim_txid },
             deposit_txid,
         };
 
@@ -302,17 +221,19 @@ impl PegOutGraph {
             assert_chain_data,
             connectors.claim_out_0,
             connectors.n_of_n,
-            connectors.post_assert_out_0,
+            connectors.post_assert_out_0.expensive_clone(),
             connectors.connector_cpfp,
             connectors.assert_data_hash_factory,
             connectors.assert_data256_factory,
         );
+        let time_taken = start_time.elapsed();
 
+        let pre_assert_txid = assert_chain.pre_assert.compute_txid();
         let post_assert_txid = assert_chain.post_assert.compute_txid();
-        let post_assert_out_amt = assert_chain.post_assert.output_amount();
 
-        debug!(event = "created assert chain", %post_assert_txid);
+        debug!(event = "created assert chain", %pre_assert_txid, %post_assert_txid, ?time_taken);
 
+        let start_time = Instant::now();
         let payout_data = PayoutData {
             post_assert_txid,
             deposit_txid,
@@ -324,7 +245,6 @@ impl PegOutGraph {
                 txid: claim_txid,
                 vout: claim_tx.slash_stake_vout(),
             },
-            input_amount: post_assert_out_amt,
             deposit_amount: graph_params.deposit_amount,
             operator_key: input.operator_pubkey,
             network: context.network(),
@@ -332,31 +252,35 @@ impl PegOutGraph {
 
         let payout_tx = PayoutTx::new(
             payout_data,
-            connectors.post_assert_out_0,
+            &connectors.post_assert_out_0,
             connectors.n_of_n,
             connectors.hashlock_payout,
             connectors.connector_cpfp,
         );
         let payout_txid = payout_tx.compute_txid();
-        debug!(event = "created payout tx", %payout_txid);
+        let time_taken = start_time.elapsed();
+        debug!(event = "created payout tx", %payout_txid, ?time_taken);
 
+        let start_time = Instant::now();
         let disprove_data = DisproveData {
             post_assert_txid,
             deposit_txid,
-            input_amount: post_assert_out_amt,
             stake_outpoint: input.stake_outpoint,
             network: context.network(),
         };
 
         let disprove_tx = DisproveTx::new(
             disprove_data,
-            stake_chain_params,
-            connectors.post_assert_out_0,
+            stake_chain_params.stake_amount,
+            stake_chain_params.burn_amount,
+            &connectors.post_assert_out_0,
             connectors.stake,
         );
         let disprove_txid = disprove_tx.compute_txid();
-        debug!(event = "created disprove tx", %disprove_txid);
+        let time_taken = start_time.elapsed();
+        debug!(event = "created disprove tx", %disprove_txid, ?time_taken);
 
+        let start_time = Instant::now();
         let slash_stake_txs = prev_claim_txids
             .iter()
             .map(|claim_txid| SlashStakeData {
@@ -377,9 +301,16 @@ impl PegOutGraph {
             })
             .collect();
 
-        Ok((
+        let time_taken = start_time.elapsed();
+        info!(?time_taken, "created slash stake txs");
+
+        let time_taken = total_start_time.elapsed();
+        info!(?time_taken, "generated peg out graph");
+
+        (
             Self {
                 claim_tx,
+                challenge_tx,
                 payout_optimistic,
                 assert_chain,
                 payout_tx,
@@ -387,9 +318,13 @@ impl PegOutGraph {
                 slash_stake_txs,
             },
             connectors,
-        ))
+        )
     }
 
+    /// Summarizes the peg-out graph.
+    ///
+    /// This is used to generate a deterministic summary of the peg-out graph that can be used to
+    /// verify the peg-out graph.
     pub fn summarize(&self) -> PegOutGraphSummary {
         PegOutGraphSummary {
             stake_txid: self.claim_tx.psbt().unsigned_tx.input[0]
@@ -408,6 +343,130 @@ impl PegOutGraph {
                 .collect(),
         }
     }
+
+    /// Generates a functor over all the sighash types for each input in the peg-out graph that need
+    /// to be Musig2-signed.
+    pub fn musig_sighash_types(&self) -> PogMusigF<TapSighashType> {
+        let challenge = self.challenge_tx.sighash_types()[0];
+
+        let AssertChain {
+            pre_assert,
+            post_assert,
+            ..
+        } = &self.assert_chain;
+
+        let pre_assert = pre_assert.sighash_types()[0];
+
+        let post_assert = post_assert.sighash_types();
+
+        let payout_optimistic = self.payout_optimistic.sighash_types();
+
+        let payout = self.payout_tx.sighash_types();
+
+        let disprove = self.disprove_tx.sighash_types()[0];
+
+        let slash_stake = self
+            .slash_stake_txs
+            .iter()
+            .map(|slash_stake| slash_stake.sighash_types())
+            .collect();
+
+        PogMusigF {
+            challenge,
+            pre_assert,
+            post_assert,
+            payout_optimistic,
+            payout,
+            disprove,
+            slash_stake,
+        }
+    }
+
+    /// Generates the sighash messages.
+    pub fn musig_sighashes(&self) -> PogMusigF<Message> {
+        let challenge = self.challenge_tx.sighashes()[0];
+
+        let AssertChain {
+            pre_assert,
+            post_assert,
+            ..
+        } = &self.assert_chain;
+
+        let pre_assert = pre_assert.sighashes()[0];
+
+        let post_assert = post_assert.sighashes();
+
+        let payout_optimistic = self.payout_optimistic.sighashes();
+
+        let payout = self.payout_tx.sighashes();
+
+        let disprove = self.disprove_tx.sighashes()[0];
+
+        let slash_stake = self
+            .slash_stake_txs
+            .iter()
+            .map(|slash_stake| slash_stake.sighashes())
+            .collect();
+
+        PogMusigF {
+            challenge,
+            pre_assert,
+            post_assert,
+            payout_optimistic,
+            payout,
+            disprove,
+            slash_stake,
+        }
+    }
+
+    /// Generates a functor over all the inpoints in the peg-out graph that need to be
+    /// Musig2-signed.
+    ///
+    /// An inpoint has the same structure as an [`OutPoint`] except that the [`Txid`] is the txid of
+    /// the transaction itself (and not the prevout), and the `vout` is just the input index
+    /// (`vin`). In any pegout graph, every inpoint is guaranteed to be unique.
+    pub fn musig_inpoints(&self) -> PogMusigF<OutPoint> {
+        let post_assert_txid = self.assert_chain.post_assert.compute_txid();
+        let payout_optimistic_txid = self.payout_optimistic.compute_txid();
+        let payout_txid = self.payout_tx.compute_txid();
+
+        PogMusigF {
+            challenge: OutPoint::new(self.challenge_tx.compute_txid(), 0),
+            pre_assert: OutPoint::new(self.assert_chain.pre_assert.compute_txid(), 0),
+            post_assert: std::array::from_fn(|i| OutPoint::new(post_assert_txid, i as u32)),
+            payout_optimistic: std::array::from_fn(|i| {
+                OutPoint::new(payout_optimistic_txid, i as u32)
+            }),
+            payout: std::array::from_fn(|i| OutPoint::new(payout_txid, i as u32)),
+            disprove: OutPoint::new(self.disprove_tx.compute_txid(), 0),
+            slash_stake: self
+                .slash_stake_txs
+                .iter()
+                .map(|tx| {
+                    let txid = tx.compute_txid();
+                    [OutPoint::new(txid, 0), OutPoint::new(txid, 1)]
+                })
+                .collect(),
+        }
+    }
+
+    /// Generates a functor over all the witnesses for each input in the peg-out graph that need to
+    /// be Musig2-signed.
+    pub fn musig_witnesses(&self) -> PogMusigF<TaprootWitness> {
+        PogMusigF {
+            challenge: self.challenge_tx.witnesses()[0].clone(),
+            pre_assert: self.assert_chain.pre_assert.witnesses()[0].clone(),
+            post_assert: self.assert_chain.post_assert.witnesses().clone(),
+            payout_optimistic: self.payout_optimistic.witnesses().clone(),
+            payout: self.payout_tx.witnesses().clone(),
+            disprove: self.disprove_tx.witnesses()[0].clone(),
+            slash_stake: self
+                .slash_stake_txs
+                .iter()
+                .map(|ss| ss.witnesses().clone())
+                .collect(),
+        }
+    }
 }
 
 /// Connectors represent UTXOs in the peg-out graph.
@@ -416,7 +475,7 @@ impl PegOutGraph {
 ///
 /// Note that this does not include the stake chain connectors as those are shared at setup time at
 /// regular intervals and not during the peg-out graph generation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct PegOutGraphConnectors {
     /// The first output of the stake transaction that kicks off the peg out graph.
     pub kickoff: ConnectorK,
@@ -433,7 +492,7 @@ pub struct PegOutGraphConnectors {
     /// The connector for the CPFP output.
     pub connector_cpfp: ConnectorCpfp,
 
-    /// The first output of the post-assert tx used to get the stake.
+    /// The first output of the post-assert tx.
     pub post_assert_out_0: ConnectorA3,
 
     /// The factory for the assertion data connectors for hashes.
@@ -452,9 +511,32 @@ pub struct PegOutGraphConnectors {
         NUM_FIELD_ELEMS_PER_CONNECTOR_BATCH_2,
     >,
 
+    /// The connector for the stake transaction.
     pub stake: ConnectorStake,
 
+    /// The connector for the hashlock payout.
     pub hashlock_payout: ConnectorP,
+}
+
+impl PegOutGraphConnectors {
+    /// Clones this set of connectors.
+    ///
+    /// This is an expensive operation as it clones the underlying connectors which hold the WOTS
+    /// public keys. This should be used cautiously in memory-constrained environments.
+    pub fn expensive_clone(&self) -> Self {
+        Self {
+            kickoff: self.kickoff.clone(),
+            claim_out_0: self.claim_out_0,
+            claim_out_1: self.claim_out_1,
+            n_of_n: self.n_of_n,
+            connector_cpfp: self.connector_cpfp,
+            post_assert_out_0: self.post_assert_out_0.expensive_clone(),
+            assert_data_hash_factory: self.assert_data_hash_factory,
+            assert_data256_factory: self.assert_data256_factory,
+            stake: self.stake,
+            hashlock_payout: self.hashlock_payout,
+        }
+    }
 }
 
 impl PegOutGraphConnectors {
@@ -473,11 +555,7 @@ impl PegOutGraphConnectors {
         let n_of_n_agg_pubkey = build_context.aggregated_pubkey();
         let network = build_context.network();
 
-        let kickoff = ConnectorK::new(
-            n_of_n_agg_pubkey,
-            network,
-            wots_public_keys.withdrawal_fulfillment,
-        );
+        let kickoff = ConnectorK::new(network, wots_public_keys.withdrawal_fulfillment.clone());
 
         let claim_out_0 = ConnectorC0::new(n_of_n_agg_pubkey, network, params.pre_assert_timelock);
 
@@ -494,15 +572,15 @@ impl PegOutGraphConnectors {
             network,
             deposit_txid,
             n_of_n_agg_pubkey,
-            wots_public_keys,
+            wots_public_keys.clone(),
             params.payout_timelock,
         );
 
         let wots::PublicKeys {
             withdrawal_fulfillment: _,
-            groth16:
-                Groth16PublicKeys(([public_inputs_hash_public_key], public_keys_256, public_keys_hash)),
+            groth16,
         } = wots_public_keys;
+        let ([public_inputs_hash_public_key], public_keys_256, public_keys_hash) = *groth16.0;
 
         let assert_data_hash_factory = ConnectorAHashFactory {
             network,
@@ -560,38 +638,37 @@ mod tests {
         hashes::{self, Hash},
         key::TapTweak,
         policy::MAX_STANDARD_TX_WEIGHT,
-        sighash::{Prevouts, SighashCache},
         taproot, transaction, Address, Amount, FeeRate, Network, OutPoint, TapSighashType,
         Transaction, TxOut,
     };
-    use bitvm::signatures::wots_api::HASH_LEN;
+    use bitcoind_async_client::types::GetTxOut;
+    use bitvm::signatures::HASH_LEN;
     use corepc_node::{serde_json::json, Client, Conf, Node};
     use rkyv::rancor::Error;
     use secp256k1::{
         rand::{rngs::OsRng, Rng},
         Keypair, SECP256K1,
     };
+    use strata_bridge_common::logging;
     use strata_bridge_db::{inmemory::public::PublicDbInMemory, public::PublicDb};
     use strata_bridge_primitives::{
         build_context::TxBuildContext,
         constants::*,
-        scripts::taproot::{create_message_hash, TaprootWitness},
-        wots::{Assertions, Wots256Signature},
+        scripts::taproot::TaprootWitness,
+        wots::{Assertions, Wots256Sig},
     };
     use strata_bridge_stake_chain::{
         prelude::{StakeTx, OPERATOR_FUNDS, STAKE_VOUT, WITHDRAWAL_FULFILLMENT_VOUT},
-        transactions::stake::StakeTxData,
+        transactions::stake::{Head, StakeTxData},
     };
     use strata_bridge_test_utils::{
+        bitcoin_rpc::fund_and_sign_raw_tx,
         musig2::generate_agg_signature,
         prelude::{
-            find_funding_utxo, generate_keypair, generate_txid, get_funding_utxo_exact,
-            sign_cpfp_child, wait_for_blocks,
+            find_funding_utxo, generate_keypair, generate_txid, sign_cpfp_child, wait_for_blocks,
         },
-        tx::{get_mock_deposit, FEES},
+        tx::get_mock_deposit,
     };
-    use strata_btcio::rpc::types::{GetTxOut, SignRawTransactionWithWallet};
-    use strata_common::logging;
     use tracing::{info, warn};
 
     use super::*;
@@ -664,15 +741,14 @@ mod tests {
 
         let prev_claim_txids = vec![generate_txid(); stake_chain_params.slash_stake_count];
         let (graph, connectors) = PegOutGraph::generate(
-            input,
+            &input,
             &context,
             deposit_txid,
             graph_params,
             connector_params,
             stake_chain_params,
             prev_claim_txids,
-        )
-        .expect("must be able to generate peg-out graph");
+        );
 
         let PegOutGraph {
             claim_tx,
@@ -680,27 +756,19 @@ mod tests {
             ..
         } = graph;
 
-        let PegOutGraphConnectors {
-            kickoff,
-            claim_out_0,
-            claim_out_1,
-            n_of_n: claim_out_2,
-            hashlock_payout,
-            connector_cpfp,
-            ..
-        } = connectors;
+        let PegOutGraphConnectors { connector_cpfp, .. } = connectors;
 
         let withdrawal_fulfillment_txid = generate_txid();
 
         let claim_input_amount = claim_tx.input_amount();
         let claim_cpfp_vout = claim_tx.cpfp_vout();
 
-        let claim_sig = Wots256Signature::new(
+        let claim_sig = Wots256Sig::new(
             MSK,
             deposit_txid,
             withdrawal_fulfillment_txid.as_byte_array(),
         );
-        let signed_claim_tx = claim_tx.finalize(*claim_sig, kickoff);
+        let signed_claim_tx = claim_tx.finalize(*claim_sig);
         info!(
             vsize = signed_claim_tx.vsize(),
             action = "broadcasting claim tx",
@@ -721,8 +789,7 @@ mod tests {
 
         assert_eq!(
             result.package_msg, "success",
-            "must have successful package submission but got: {:?}",
-            result
+            "must have successful package submission but got: {result:?}",
         );
         assert_eq!(
             result.tx_results.len(),
@@ -734,23 +801,13 @@ mod tests {
             .generate_to_address(6, &btc_addr)
             .expect("must be able to mine blocks");
 
-        let mut sighash_cache = SighashCache::new(&payout_optimistic.psbt().unsigned_tx);
-
-        let prevouts = payout_optimistic.prevouts();
         let witnesses = payout_optimistic.witnesses();
 
-        let mut signatures = witnesses.iter().enumerate().map(|(i, witness)| {
-            let message = create_message_hash(
-                &mut sighash_cache,
-                prevouts.clone(),
-                witness,
-                TapSighashType::Default,
-                i,
-            )
-            .expect("must be able to create a message hash");
-
-            generate_agg_signature(&message, &n_of_n_keypair, witness)
-        });
+        let signatures = witnesses
+            .iter()
+            .zip(payout_optimistic.sighashes())
+            .map(|(witness, sighash)| generate_agg_signature(&sighash, &n_of_n_keypair, witness))
+            .collect::<Vec<_>>();
 
         assert_eq!(
             signatures.len(),
@@ -758,32 +815,10 @@ mod tests {
             "must have signatures for all inputs"
         );
 
-        let deposit_signature = signatures.next().expect("must have deposit signature");
-        let n_of_n_sig_c0 = signatures
-            .next()
-            .expect("must have n-of-n signature for c0");
-        let n_of_n_sig_c1 = signatures
-            .next()
-            .expect("must have n-of-n signature for c1");
-        let n_of_n_sig_c2 = signatures
-            .next()
-            .expect("must have n-of-n signature for c2");
-        let n_of_n_sig_p = signatures.next().expect("must have n-of-n signature for p");
-
         let payout_input_amount = payout_optimistic.input_amount();
         let payout_cpfp_vout = payout_optimistic.cpfp_vout();
 
-        let signed_payout_tx = payout_optimistic.finalize(
-            deposit_signature,
-            n_of_n_sig_c0,
-            n_of_n_sig_c1,
-            n_of_n_sig_c2,
-            n_of_n_sig_p,
-            claim_out_0,
-            claim_out_1,
-            claim_out_2,
-            hashlock_payout,
-        );
+        let signed_payout_tx = payout_optimistic.finalize(signatures.try_into().unwrap());
         let payout_amount = signed_payout_tx.output[0].value;
         let payout_txid = signed_payout_tx.compute_txid().to_string();
 
@@ -830,8 +865,7 @@ mod tests {
 
         assert_eq!(
             result.package_msg, "success",
-            "submit package message must be success but got: {:?}",
-            result
+            "submit package message must be success but got: {result:?}",
         );
         assert_eq!(result.tx_results.len(), 2, "must have two tx results");
 
@@ -880,38 +914,25 @@ mod tests {
         let SubmitAssertionsResult {
             payout_tx,
             post_assert_out_0,
-            n_of_n: claim_out_2,
-            hashlock_payout,
             ..
         } = submit_assertions(
             btc_client,
             &n_of_n_keypair,
             &context,
             deposit_txid,
-            input,
+            &input,
             graph_params,
             connector_params,
             assertions,
         )
         .await;
 
-        let mut sighash_cache = SighashCache::new(&payout_tx.psbt().unsigned_tx);
-
-        let prevouts = payout_tx.prevouts();
         let witnesses = payout_tx.witnesses();
 
-        let mut signatures = witnesses.iter().enumerate().map(|(i, witness)| {
-            let message = create_message_hash(
-                &mut sighash_cache,
-                prevouts.clone(),
-                witness,
-                TapSighashType::Default,
-                i,
-            )
-            .expect("must be able to create a message hash");
-
-            generate_agg_signature(&message, &n_of_n_keypair, witness)
-        });
+        let mut signatures = witnesses
+            .iter()
+            .zip(payout_tx.sighashes())
+            .map(|(witness, sighash)| generate_agg_signature(&sighash, &n_of_n_keypair, witness));
 
         let deposit_signature = signatures.next().expect("must have deposit signature");
         let n_of_n_sig_a3 = signatures
@@ -926,13 +947,13 @@ mod tests {
         let payout_input_amount = payout_tx.input_amount();
         let payout_cpfp_vout = payout_tx.cpfp_vout();
         let signed_payout_tx = payout_tx.finalize(
-            deposit_signature,
-            n_of_n_sig_a3,
-            n_of_n_sig_c2,
-            n_of_n_sig_p,
             post_assert_out_0,
-            claim_out_2,
-            hashlock_payout,
+            [
+                deposit_signature,
+                n_of_n_sig_a3,
+                n_of_n_sig_c2,
+                n_of_n_sig_p,
+            ],
         );
         let payout_amount = signed_payout_tx.output[0].value;
         let payout_txid = signed_payout_tx.compute_txid().to_string();
@@ -976,8 +997,7 @@ mod tests {
 
         assert_eq!(
             result.package_msg, "success",
-            "submit package message must be success but got: {:?}",
-            result
+            "submit package message must be success but got: {result:?}",
         );
         assert_eq!(result.tx_results.len(), 2, "must have two tx results");
 
@@ -1011,6 +1031,7 @@ mod tests {
 
         let (input, _, _) =
             create_tx_graph_input(btc_client, &context, n_of_n_keypair, public_keys);
+
         let graph_params = PegOutGraphParams {
             deposit_amount: DEPOSIT_AMOUNT,
             ..Default::default()
@@ -1025,8 +1046,8 @@ mod tests {
         for _ in 0..faulty_assertions.groth16.2.len() {
             let proof_index_to_tweak = OsRng.gen_range(0..faulty_assertions.groth16.2.len());
             warn!(action = "introducing faulty assertion", index=%proof_index_to_tweak);
-            if faulty_assertions.groth16.2[proof_index_to_tweak] != [0u8; HASH_LEN as usize] {
-                faulty_assertions.groth16.2[proof_index_to_tweak] = [0u8; HASH_LEN as usize];
+            if faulty_assertions.groth16.2[proof_index_to_tweak] != [0u8; HASH_LEN] {
+                faulty_assertions.groth16.2[proof_index_to_tweak] = [0u8; HASH_LEN];
                 break;
             }
         }
@@ -1039,14 +1060,13 @@ mod tests {
             signed_post_assert,
             post_assert_out_0,
             disprove_tx,
-            stake,
             ..
         } = submit_assertions(
             btc_client,
             &n_of_n_keypair,
             &context,
             deposit_txid,
-            input,
+            &input,
             graph_params,
             connector_params,
             faulty_assertions,
@@ -1074,13 +1094,11 @@ mod tests {
                 .try_into()
                 .expect("the number of assert data txs must match"),
         )
-        .expect("must be able to parse assert data txs")
-        .expect("must have assertion witness");
+        .expect("must be able to parse assert data txs");
 
         info!("extracting withdrawal fulfillment txid commitment from claim transaction");
-        let sig_withdrawal_fulfillment_txid = ClaimTx::parse_witness(&signed_claim_tx)
-            .expect("must be able to parse claim witness")
-            .expect("must have claim witness");
+        let sig_withdrawal_fulfillment_txid =
+            ClaimTx::parse_witness(&signed_claim_tx).expect("must be able to parse claim witness");
 
         // TODO: find a way to get the groth16 disprove leaf without having to compile the actual
         // partial verification scripts (and vk).
@@ -1097,31 +1115,18 @@ mod tests {
         };
 
         info!("finalizing disprove transaction");
-        let mut sighash_cache = SighashCache::new(&disprove_tx.psbt().unsigned_tx);
-        let prevouts = disprove_tx.prevouts();
-        let input_index = 0;
+        const INPUT_INDEX: usize = 0;
 
-        let witness_type = &disprove_tx.witnesses()[input_index];
+        let witness_type = &disprove_tx.witnesses()[INPUT_INDEX];
         assert!(
             matches!(witness_type, TaprootWitness::Tweaked { .. }),
             "witness on the first input must be tweaked"
         );
 
-        let sighash_type = disprove_tx.psbt().inputs[input_index]
-            .sighash_type
-            .expect("sighash type must be set on the first index of the disprove tx")
-            .taproot_hash_ty()
-            .unwrap();
+        let sighash_type = disprove_tx.sighash_types()[0];
         assert_eq!(sighash_type, TapSighashType::Single);
 
-        let disprove_msg = create_message_hash(
-            &mut sighash_cache,
-            prevouts,
-            witness_type,
-            sighash_type,
-            input_index,
-        )
-        .unwrap();
+        let disprove_msg = disprove_tx.sighashes()[INPUT_INDEX];
         let disprove_sig = generate_agg_signature(&disprove_msg, &n_of_n_keypair, witness_type);
         let disprove_sig = taproot::Signature {
             signature: disprove_sig,
@@ -1139,7 +1144,6 @@ mod tests {
             reward,
             disprove_witness,
             input_disprove_leaf,
-            stake,
             post_assert_out_0,
         );
 
@@ -1168,7 +1172,7 @@ mod tests {
         conf.args.push("-txindex=1");
         conf.args.push("-acceptnonstdtxn=1");
 
-        let bitcoind = Node::from_downloaded_with_conf(&conf).unwrap();
+        let bitcoind = Node::with_conf("bitcoind", &conf).unwrap();
         let btc_client = &bitcoind.client;
 
         let network = btc_client
@@ -1214,7 +1218,7 @@ mod tests {
         context: &TxBuildContext,
         operator_keypair: Keypair,
         wots_public_keys: wots::PublicKeys,
-    ) -> (PegOutGraphInput, [u8; 32], Amount) {
+    ) -> (PegOutGraphInput, [u8; 32], StakeTx<Head>) {
         let operator_pubkey = operator_keypair.x_only_public_key().0;
         let wallet_addr = btc_client.new_address().expect("must generate new address");
 
@@ -1227,8 +1231,9 @@ mod tests {
 
         info!("creating transaction to fund dust outputs");
         let operator_address = Address::p2tr(SECP256K1, operator_pubkey, None, context.network());
+        let funding_address = operator_address.clone();
         let result = btc_client
-            .send_to_address(&operator_address, OPERATOR_FUNDS)
+            .send_to_address(&funding_address, OPERATOR_FUNDS)
             .unwrap();
         btc_client.generate_to_address(1, &wallet_addr).unwrap();
         let operator_funds_tx = btc_client.get_transaction(result.txid().unwrap()).unwrap();
@@ -1251,8 +1256,9 @@ mod tests {
             .unwrap();
 
         info!("creating transaction for operator's stake");
+        let pre_stake_address = operator_address.clone();
         let result = btc_client
-            .send_to_address(&operator_address, OPERATOR_STAKE)
+            .send_to_address(&pre_stake_address, OPERATOR_STAKE)
             .unwrap();
         btc_client.generate_to_address(1, &wallet_addr).unwrap();
         let operator_stake_tx = btc_client.get_transaction(result.txid().unwrap()).unwrap();
@@ -1274,65 +1280,35 @@ mod tests {
             })
             .unwrap();
 
-        let first_stake = StakeTx::create_initial(
+        let first_stake = StakeTx::<Head>::new(
             context,
             &stake_chain_params,
             stake_hash,
-            wots_public_keys.withdrawal_fulfillment,
+            wots_public_keys.withdrawal_fulfillment.clone(),
             pre_stake,
             operator_funds,
             operator_pubkey,
-            connector_cpfp,
         );
 
         info!("signing and broadcasting the first stake tx");
-        let prevouts = vec![
-            TxOut {
-                value: OPERATOR_FUNDS,
-                script_pubkey: operator_address.script_pubkey(),
-            },
-            TxOut {
-                value: OPERATOR_STAKE,
-                script_pubkey: operator_address.script_pubkey(),
-            },
+        let prevouts = [
+            operator_address.script_pubkey(),
+            operator_address.script_pubkey(),
         ];
-        let prevouts = Prevouts::All(&prevouts);
-
-        let mut sighash_cache = SighashCache::new(&first_stake.psbt.unsigned_tx);
-        let witnesses = first_stake.witnesses();
-
-        let message_hash_0 = create_message_hash(
-            &mut sighash_cache,
-            prevouts.clone(),
-            &witnesses[0],
-            TapSighashType::Default,
-            0,
-        )
-        .unwrap();
 
         let tweaked_operator_keypair = operator_keypair.tap_tweak(SECP256K1, None);
+        let messages = first_stake.sighashes(OPERATOR_STAKE, prevouts);
 
         let op_signature_0 =
-            SECP256K1.sign_schnorr(&message_hash_0, &tweaked_operator_keypair.to_inner());
-
-        let message_hash_1 = create_message_hash(
-            &mut sighash_cache,
-            prevouts,
-            &witnesses[1],
-            TapSighashType::Default,
-            1,
-        )
-        .unwrap();
+            SECP256K1.sign_schnorr(&messages[0], &tweaked_operator_keypair.to_keypair());
         let op_signature_1 =
-            SECP256K1.sign_schnorr(&message_hash_1, &tweaked_operator_keypair.to_inner());
+            SECP256K1.sign_schnorr(&messages[1], &tweaked_operator_keypair.to_keypair());
 
         let signed_first_stake_tx = first_stake
             .clone()
-            .finalize_initial(op_signature_0, op_signature_1);
+            .finalize_unchecked(op_signature_0, op_signature_1);
 
         let input_amount = OPERATOR_FUNDS + OPERATOR_STAKE;
-        let graph_funding_amount =
-            signed_first_stake_tx.output[WITHDRAWAL_FULFILLMENT_VOUT as usize].value;
         let cpfp_child = create_cpfp_child(
             btc_client,
             &operator_keypair,
@@ -1351,8 +1327,7 @@ mod tests {
 
         assert_eq!(
             result.package_msg, "success",
-            "must be able to submit first stake package but got: {:?}",
-            result
+            "must be able to submit first stake package but got: {result:?}",
         );
 
         btc_client.generate_to_address(1, &wallet_addr).unwrap();
@@ -1372,7 +1347,7 @@ mod tests {
                 operator_pubkey,
             },
             stake_preimage,
-            graph_funding_amount,
+            first_stake,
         )
     }
 
@@ -1382,9 +1357,6 @@ mod tests {
         payout_tx: PayoutTx,
         post_assert_out_0: ConnectorA3,
         disprove_tx: DisproveTx,
-        stake: ConnectorStake,
-        n_of_n: ConnectorNOfN,
-        hashlock_payout: ConnectorP,
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -1393,7 +1365,7 @@ mod tests {
         keypair: &Keypair,
         context: &TxBuildContext,
         deposit_txid: Txid,
-        input: PegOutGraphInput,
+        input: &PegOutGraphInput,
         graph_params: PegOutGraphParams,
         connector_params: ConnectorParams,
         assertions: Assertions,
@@ -1410,8 +1382,8 @@ mod tests {
             connector_params,
             stake_chain_params,
             vec![],
-        )
-        .expect("must be able to generate peg-out graph");
+        );
+
         let PegOutGraph {
             claim_tx,
             assert_chain,
@@ -1421,16 +1393,11 @@ mod tests {
         } = graph;
 
         let PegOutGraphConnectors {
-            kickoff,
-            claim_out_0,
             claim_out_1,
-            n_of_n,
             connector_cpfp,
             post_assert_out_0,
             assert_data_hash_factory,
             assert_data256_factory,
-            stake,
-            hashlock_payout,
             ..
         } = connectors;
 
@@ -1438,12 +1405,12 @@ mod tests {
         let claim_input_amount = claim_tx.input_amount();
         let claim_cpfp_vout = claim_tx.cpfp_vout();
 
-        let claim_sig = Wots256Signature::new(
+        let claim_sig = Wots256Sig::new(
             MSK,
             deposit_txid,
             withdrawal_fulfillment_txid.as_byte_array(),
         );
-        let signed_claim_tx = claim_tx.finalize(*claim_sig, kickoff);
+        let signed_claim_tx = claim_tx.finalize(*claim_sig);
         info!(vsize = signed_claim_tx.vsize(), "broadcasting claim tx");
 
         let claim_child_tx = create_cpfp_child(
@@ -1461,8 +1428,7 @@ mod tests {
 
         assert_eq!(
             result.package_msg, "success",
-            "must have successful package submission for claim but got: {:?}",
-            result
+            "must have successful package submission for claim but got: {result:?}",
         );
         assert_eq!(
             result.tx_results.len(),
@@ -1488,45 +1454,20 @@ mod tests {
 
         let challenge_tx = ChallengeTx::new(challenge_tx_input, claim_out_1);
 
-        let unsigned_challenge_tx = challenge_tx.psbt().unsigned_tx.clone();
-        let mut sighash_cache = SighashCache::new(&unsigned_challenge_tx);
         let input_index = challenge_leaf.get_input_index() as usize;
         let challenge_witness = &challenge_tx.witnesses()[input_index];
-        let msg_hash = create_message_hash(
-            &mut sighash_cache,
-            challenge_tx.prevouts(),
-            challenge_witness,
-            challenge_leaf.get_sighash_type(),
-            input_index,
-        )
-        .expect("should be able to create message hash");
+        let msg_hash = challenge_tx.sighashes()[input_index];
+
         let signature = generate_agg_signature(&msg_hash, keypair, challenge_witness);
         let signature = taproot::Signature {
             signature,
             sighash_type: challenge_leaf.get_sighash_type(),
         };
         let signed_challenge_leaf = challenge_leaf.add_witness_data(signature);
+        let partially_signed_challenge_tx = challenge_tx.finalize_presigned(signed_challenge_leaf);
 
-        let (funding_input, funding_utxo) =
-            get_funding_utxo_exact(btc_client, CHALLENGE_COST + FEES);
-
-        let funded_challenge_tx = challenge_tx
-            .add_funding_input(funding_utxo, funding_input)
-            .expect("must be able to add funding input to challenge tx");
-        let partially_signed_challenge_tx = funded_challenge_tx
-            .finalize(claim_out_1, signed_challenge_leaf)
-            .expect("must be able to finalize challenge tx");
-
-        let raw_partially_signed_challenge_tx =
-            consensus::encode::serialize_hex(&partially_signed_challenge_tx);
-        let result = btc_client
-            .call::<SignRawTransactionWithWallet>(
-                "signrawtransactionwithwallet",
-                &[json!(raw_partially_signed_challenge_tx)],
-            )
-            .expect("must be able to sign tx");
-        let signed_challenge_tx = consensus::encode::deserialize_hex::<Transaction>(&result.hex)
-            .expect("must be able to deserialize signed tx");
+        let signed_challenge_tx =
+            fund_and_sign_raw_tx(btc_client, &partially_signed_challenge_tx, None, Some(true));
 
         info!(
             vsize = signed_challenge_tx.vsize(),
@@ -1546,21 +1487,12 @@ mod tests {
             post_assert,
         } = assert_chain;
 
-        let mut sighash_cache = SighashCache::new(&pre_assert.psbt().unsigned_tx);
-        let prevouts = pre_assert.prevouts();
         let witnesses = pre_assert.witnesses();
         let pre_assert_input_amount = pre_assert.input_amount();
         let pre_assert_cpfp_vout = pre_assert.cpfp_vout();
-        let tx_hash = create_message_hash(
-            &mut sighash_cache,
-            prevouts,
-            &witnesses[0],
-            TapSighashType::Default,
-            0,
-        )
-        .expect("must be able create a message hash for tx");
+        let tx_hash = pre_assert.sighashes()[0];
         let n_of_n_sig = generate_agg_signature(&tx_hash, keypair, &witnesses[0]);
-        let signed_pre_assert = pre_assert.finalize(claim_out_0, n_of_n_sig);
+        let signed_pre_assert = pre_assert.finalize(n_of_n_sig);
         assert_eq!(
             signed_pre_assert.version,
             transaction::Version(3),
@@ -1591,8 +1523,7 @@ mod tests {
 
         assert_eq!(
             result.package_msg, "success",
-            "must have successful package submission but got: {:?}",
-            result
+            "must have successful package submission but got: {result:?}",
         );
         assert_eq!(
             result.tx_results.len(),
@@ -1601,7 +1532,7 @@ mod tests {
         );
 
         btc_client
-            .generate_to_address(6, &btc_addr)
+            .generate_to_address(1, &btc_addr)
             .expect("must be able to mine blocks");
 
         let assert_sigs = wots::Signatures::new(MSK, deposit_txid, assertions);
@@ -1622,7 +1553,6 @@ mod tests {
             "number of assert data transactions must match"
         );
 
-        let num_signed_assert_data_txs = signed_assert_data_txs.len();
         let mut total_assert_vsize = 0;
         let mut total_assert_with_child_vsize = 0;
 
@@ -1636,7 +1566,6 @@ mod tests {
                 );
 
                 assert_eq!(tx.output.len(), 2, "assert data tx {i} must have 2 outputs -- one to consolidate, the other to CPFP");
-                let assert_data_txid = tx.compute_txid();
 
                 let signed_child_tx = create_cpfp_child(
                     btc_client,
@@ -1663,38 +1592,19 @@ mod tests {
 
                 assert_eq!(result.package_msg, "success", "must have successful package submission but got: {result:?}");
                 assert_eq!(result.tx_results.len(), 2, "must have two transactions in package");
-
-                // generate a block so that the mempool size limit is not hit
-                btc_client
-                    .generate_to_address(1, &btc_addr)
-                    .expect("must be able to mine assert data tx");
-
-                btc_client.call::<String>("getrawtransaction", &[json!(assert_data_txid.to_string())]).expect("must be able to get assert data tx");
             });
 
         btc_client
-            .generate_to_address(5, &btc_addr)
+            .generate_to_address(1, &btc_addr)
             .expect("must be able to mine blocks");
 
         info!(%total_assert_vsize, %total_assert_with_child_vsize, "submitted all assert data txs");
 
-        let mut sighash_cache = SighashCache::new(&post_assert.psbt().unsigned_tx);
-
-        let prevouts = post_assert.prevouts();
         let witnesses = post_assert.witnesses();
-        let post_assert_sigs = (0..num_signed_assert_data_txs)
-            .map(|i| {
-                let message = create_message_hash(
-                    &mut sighash_cache,
-                    prevouts.clone(),
-                    &witnesses[i],
-                    TapSighashType::Default,
-                    i,
-                )
-                .expect("must be able to create a message hash");
-
-                generate_agg_signature(&message, keypair, &witnesses[i])
-            })
+        let post_assert_sigs = witnesses
+            .iter()
+            .zip(post_assert.sighashes())
+            .map(|(witness, sighash)| generate_agg_signature(&sighash, keypair, witness))
             .collect::<Vec<_>>();
 
         let post_assert_input_amount = post_assert.input_amount();
@@ -1714,6 +1624,7 @@ mod tests {
         info!(
             txid = signed_post_assert.compute_txid().to_string(),
             final_output_amount = %post_assert_output_amount,
+            vsize = %signed_post_assert.vsize(),
             "broadcasting post-assert tx"
         );
         let result = btc_client
@@ -1726,8 +1637,7 @@ mod tests {
 
         assert_eq!(
             result.package_msg, "success",
-            "must have successful package submission but got: {:?}",
-            result
+            "must have successful package submission but got: {result:?}",
         );
         assert_eq!(
             result.tx_results.len(),
@@ -1745,9 +1655,6 @@ mod tests {
             payout_tx,
             post_assert_out_0,
             disprove_tx,
-            stake,
-            n_of_n,
-            hashlock_payout,
         }
     }
 
@@ -1827,7 +1734,7 @@ mod tests {
         let btc_addr = btc_client.new_address().expect("must generate new address");
         let operator_pubkey = n_of_n_keypair.x_only_public_key().0;
 
-        let (input, stake_preimage, _) =
+        let (input, stake_preimage, first_stake_tx) =
             create_tx_graph_input(btc_client, &context, n_of_n_keypair, wots_public_keys);
         let stake_chain_params = StakeChainParams::default();
         let graph_params = PegOutGraphParams {
@@ -1841,38 +1748,33 @@ mod tests {
         };
 
         let (graph, connectors) = PegOutGraph::generate(
-            input.clone(),
+            &input,
             &context,
             deposit_txid,
             graph_params,
             connector_params,
             stake_chain_params,
             vec![],
-        )
-        .expect("must be able to generate peg-out graph");
+        );
 
         let PegOutGraph {
             claim_tx: ongoing_claim_tx,
             ..
         } = graph;
 
-        let PegOutGraphConnectors {
-            kickoff,
-            connector_cpfp,
-            ..
-        } = connectors;
+        let PegOutGraphConnectors { connector_cpfp, .. } = connectors;
 
         let withdrawal_fulfillment_txid = generate_txid();
 
         let claim_input_amount = ongoing_claim_tx.input_amount();
         let claim_cpfp_vout = ongoing_claim_tx.cpfp_vout();
 
-        let claim_sig = Wots256Signature::new(
+        let claim_sig = Wots256Sig::new(
             MSK,
             deposit_txid,
             withdrawal_fulfillment_txid.as_byte_array(),
         );
-        let signed_ongoing_claim_tx = ongoing_claim_tx.finalize(*claim_sig, kickoff);
+        let signed_ongoing_claim_tx = ongoing_claim_tx.finalize(*claim_sig);
         info!(
             action = "broadcasting claim tx",
             vsize = signed_ongoing_claim_tx.vsize(),
@@ -1898,8 +1800,7 @@ mod tests {
 
         assert_eq!(
             result.package_msg, "success",
-            "must have successful package submission for claim but got: {:?}",
-            result
+            "must have successful package submission for claim but got: {result:?}",
         );
         assert_eq!(
             result.tx_results.len(),
@@ -1922,7 +1823,7 @@ mod tests {
         // create new stake tx
         let new_preimage = OsRng.gen::<[u8; 32]>();
         let new_hash = hashes::sha256::Hash::hash(&new_preimage);
-        let new_withdrawal_fulfillment_pk = wots_public_keys.withdrawal_fulfillment;
+        let new_withdrawal_fulfillment_pk = wots_public_keys.withdrawal_fulfillment.clone();
         let prev_claim_txids = [signed_ongoing_claim_tx.compute_txid()];
         let funding_address = Address::p2tr_tweaked(
             operator_pubkey.dangerous_assume_tweaked(),
@@ -1950,17 +1851,10 @@ mod tests {
             operator_funds: funding_outpoint,
             hash: new_hash,
             withdrawal_fulfillment_pk: new_withdrawal_fulfillment_pk,
+            operator_pubkey,
         };
 
-        let new_stake_tx = StakeTx::advance(
-            &context,
-            &stake_chain_params,
-            stake_data,
-            input.stake_hash,
-            input.stake_outpoint,
-            operator_pubkey,
-            connector_cpfp,
-        );
+        let new_stake_tx = first_stake_tx.advance(&context, &stake_chain_params, stake_data);
 
         let new_stake_txid = new_stake_tx.compute_txid();
         let input = PegOutGraphInput {
@@ -1987,15 +1881,14 @@ mod tests {
             payout_timelock: 10,
         };
         let (new_graph, new_connectors) = PegOutGraph::generate(
-            input.clone(),
+            &input,
             &context,
             deposit_txid,
             graph_params,
             connector_params,
             stake_chain_params,
             prev_claim_txids.to_vec(),
-        )
-        .expect("must be able to create graph");
+        );
 
         assert_eq!(
             new_graph.slash_stake_txs.len(),
@@ -2006,40 +1899,13 @@ mod tests {
         );
 
         info!(action = "advancing the stake while previous claim is present", txid = %new_stake_tx.compute_txid());
+        let messages = new_stake_tx.sighashes(funding_address.script_pubkey());
 
+        let funds_signature = SECP256K1.sign_schnorr(&messages[0], &n_of_n_keypair);
+        let stake_signature = SECP256K1.sign_schnorr(&messages[1], &n_of_n_keypair);
         let prev_connector_s = connectors.stake;
-        let mut sighash_cache = SighashCache::new(&new_stake_tx.psbt.unsigned_tx);
-        let prevouts = new_stake_tx
-            .psbt
-            .inputs
-            .iter()
-            .map(|input| input.witness_utxo.clone().unwrap())
-            .collect::<Vec<_>>();
-        let prevouts = Prevouts::All(&prevouts);
 
-        let funds_witness = new_stake_tx.witnesses().first().unwrap();
-        let funding_tx_msg = create_message_hash(
-            &mut sighash_cache,
-            prevouts.clone(),
-            funds_witness,
-            TapSighashType::Default,
-            0,
-        )
-        .unwrap();
-        let funds_signature = SECP256K1.sign_schnorr(&funding_tx_msg, &n_of_n_keypair);
-
-        let stake_witness = new_stake_tx.witnesses().last().unwrap();
-        let stake_msg_hash = create_message_hash(
-            &mut sighash_cache,
-            prevouts,
-            stake_witness,
-            TapSighashType::Default,
-            1,
-        )
-        .unwrap();
-        let stake_signature = SECP256K1.sign_schnorr(&stake_msg_hash, &n_of_n_keypair);
-
-        let signed_new_stake_tx = new_stake_tx.finalize(
+        let signed_new_stake_tx = new_stake_tx.finalize_unchecked(
             &stake_preimage,
             funds_signature,
             stake_signature,
@@ -2060,8 +1926,7 @@ mod tests {
 
         assert_eq!(
             result.package_msg, "success",
-            "must have successful package submission for new stake but got: {:?}",
-            result
+            "must have successful package submission for new stake but got: {result:?}",
         );
         assert_eq!(
             result.tx_results.len(),
@@ -2073,54 +1938,15 @@ mod tests {
 
         info!(action = "trying to spend slash stake tx");
         let slash_stake_tx = new_graph.slash_stake_txs[0].clone();
+        let sighashes = slash_stake_tx.sighashes();
+        let witnesses = slash_stake_tx.witnesses();
 
         let claim_out_conn = new_connectors.n_of_n;
         let stake_conn = new_connectors.stake;
 
-        let prevouts = slash_stake_tx
-            .psbt()
-            .inputs
-            .iter()
-            .map(|input| input.witness_utxo.clone().expect("must have witness utxo"))
-            .collect::<Vec<_>>();
-        let prevouts = Prevouts::All(&prevouts);
+        let claim_sig = generate_agg_signature(&sighashes[0], &n_of_n_keypair, &witnesses[0]);
 
-        let claim_input_index = 0;
-        let claim_witness = &slash_stake_tx.witnesses()[claim_input_index];
-        let claim_sighash = slash_stake_tx.psbt().inputs[claim_input_index]
-            .sighash_type
-            .unwrap()
-            .taproot_hash_ty()
-            .unwrap();
-        let mut sighash_cache = SighashCache::new(&slash_stake_tx.psbt().unsigned_tx);
-        let claim_slash_stake_msg = create_message_hash(
-            &mut sighash_cache,
-            prevouts.clone(),
-            claim_witness,
-            claim_sighash,
-            claim_input_index,
-        )
-        .unwrap();
-        let claim_sig =
-            generate_agg_signature(&claim_slash_stake_msg, &n_of_n_keypair, claim_witness);
-
-        let stake_input_index = 1;
-        let stake_witness = &slash_stake_tx.witnesses()[stake_input_index];
-        let stake_sighash = slash_stake_tx.psbt().inputs[stake_input_index]
-            .sighash_type
-            .unwrap()
-            .taproot_hash_ty()
-            .unwrap();
-        let stake_slash_stake_msg = create_message_hash(
-            &mut sighash_cache,
-            prevouts,
-            stake_witness,
-            stake_sighash,
-            stake_input_index,
-        )
-        .unwrap();
-        let stake_sig =
-            generate_agg_signature(&stake_slash_stake_msg, &n_of_n_keypair, stake_witness);
+        let stake_sig = generate_agg_signature(&sighashes[1], &n_of_n_keypair, &witnesses[1]);
 
         let mut signed_slash_stake_tx =
             slash_stake_tx.finalize(claim_sig, stake_sig, claim_out_conn, stake_conn);

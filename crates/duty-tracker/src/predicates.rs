@@ -10,10 +10,14 @@ use bitcoin::{
 };
 use bitcoin_bosd::Descriptor;
 use btc_notify::client::TxPredicate;
-use strata_bridge_primitives::{deposit::DepositInfo, types::OperatorIdx};
-use strata_l1tx::{envelope::parser::parse_envelope_payloads, filter::TxFilterConfig};
+use strata_bridge_primitives::{build_context::BuildContext, types::OperatorIdx};
+use strata_bridge_tx_graph::transactions::{
+    claim::CHALLENGE_VOUT, deposit::DepositRequestData, prelude::POST_ASSERT_INPUT_INDEX,
+};
+use strata_l1tx::{envelope::parser::parse_envelope_payloads, filter::types::TxFilterConfig};
 use strata_primitives::params::RollupParams;
-use strata_state::batch::{Checkpoint, SignedCheckpoint};
+use strata_state::batch::{verify_signed_checkpoint_sig, Checkpoint, SignedCheckpoint};
+use tracing::warn;
 
 fn op_return_data(script: &Script) -> Option<&[u8]> {
     let mut instructions = script.instructions();
@@ -44,13 +48,13 @@ pub(crate) fn deposit_request_info(
     tx: &Transaction,
     sidesystem_params: &RollupParams,
     pegout_graph_params: &PegOutGraphParams,
+    build_context: &impl BuildContext,
     stake_index: u32,
-) -> Option<DepositInfo> {
+) -> Option<DepositRequestData> {
     let deposit_request_output = tx.output.first()?;
     if deposit_request_output.value <= pegout_graph_params.deposit_amount {
         return None;
     }
-    // TODO(proofofkeags): validate that the script_pubkey pays to the right operator set
 
     let ee_address_size = sidesystem_params.address_length as usize;
     let tag = pegout_graph_params.tag.as_bytes();
@@ -63,27 +67,39 @@ pub(crate) fn deposit_request_info(
             let recovery_x_only_pk = meta.get(..SCHNORR_PUBLIC_KEY_SIZE)?;
             // TODO: handle error variant and get rid of expect.
             let recovery_x_only_pk = XOnlyPublicKey::from_slice(recovery_x_only_pk)
-                .expect("Failed to parse XOnlyPublicKey");
+                .expect("failed to parse XOnlyPublicKey");
             let el_addr =
                 meta.get(SCHNORR_PUBLIC_KEY_SIZE..SCHNORR_PUBLIC_KEY_SIZE + ee_address_size)?;
             Some((recovery_x_only_pk, el_addr))
         })?;
 
-    Some(DepositInfo::new(
+    let deposit_request_data = DepositRequestData::new(
         OutPoint::new(tx.compute_txid(), 0),
         stake_index,
         el_addr.to_vec(),
         deposit_request_output.value,
         recovery_x_only_pk,
         deposit_request_output.script_pubkey.clone(),
-    ))
+    );
+
+    // Regenerate the P2TR address from the OP_RETURN data, for now the spend info does all the
+    // necessary validations.
+    deposit_request_data
+        .validate(build_context, pegout_graph_params.refund_delay)
+        .map_err(|e| {
+            warn!(err=%e, txid=%tx.compute_txid(), "DRT failed validation");
+            None::<DepositRequestData>
+        })
+        .ok()?;
+
+    Some(deposit_request_data)
 }
 
 pub(crate) fn is_challenge(claim_txid: Txid) -> TxPredicate {
     Arc::new(move |tx| {
         tx.input
             .first()
-            .map(|txin| txin.previous_output == OutPoint::new(claim_txid, 1))
+            .map(|txin| txin.previous_output == OutPoint::new(claim_txid, CHALLENGE_VOUT))
             .unwrap_or(false)
             && tx.output.len() == 1
     })
@@ -92,7 +108,7 @@ pub(crate) fn is_challenge(claim_txid: Txid) -> TxPredicate {
 pub(crate) fn is_disprove(post_assert_txid: Txid) -> TxPredicate {
     Arc::new(move |tx| {
         tx.input
-            .first()
+            .get(POST_ASSERT_INPUT_INDEX)
             .map(|txin| txin.previous_output == OutPoint::new(post_assert_txid, 0))
             .unwrap_or(false)
             && tx.input.len() == 2
@@ -175,21 +191,27 @@ pub(crate) fn parse_strata_checkpoint(
     let filter_config =
         TxFilterConfig::derive_from(rollup_params).expect("rollup params must be valid");
 
-    if let Some(script) = tx.input[0].witness.tapscript() {
-        let script = script.to_bytes();
-        if let Ok(inscription) = parse_envelope_payloads(&script.into(), &filter_config) {
-            if inscription.is_empty() {
-                return None;
-            }
-            if let Ok(signed_batch_checkpoint) =
-                borsh::from_slice::<SignedCheckpoint>(inscription[0].data())
-            {
-                return Some(signed_batch_checkpoint.into());
-            }
-        }
+    let script = tx.input[0].witness.taproot_leaf_script()?.script.to_bytes();
+
+    let Ok(inscriptions) = parse_envelope_payloads(&script.into(), &filter_config) else {
+        return None;
+    };
+
+    if inscriptions.is_empty() {
+        return None;
     }
 
-    None
+    let Ok(signed_checkpoint) = borsh::from_slice::<SignedCheckpoint>(inscriptions[0].data())
+    else {
+        return None;
+    };
+
+    let cred_rule = &rollup_params.cred_rule;
+    if !verify_signed_checkpoint_sig(&signed_checkpoint, cred_rule) {
+        return None;
+    }
+
+    Some(signed_checkpoint.into())
 }
 
 #[cfg(test)]
@@ -211,7 +233,7 @@ mod tests {
         let peg_out_graph_params = PegOutGraphParams::default();
 
         let metadata = WithdrawalMetadata {
-            tag: peg_out_graph_params.tag.as_bytes().to_vec(),
+            tag: peg_out_graph_params.tag,
             operator_idx: 1,
             deposit_idx: 2,
             deposit_txid: generate_txid(),
@@ -270,7 +292,7 @@ mod tests {
         let blocks: Vec<Block> = bincode::deserialize(&blocks_bytes).unwrap();
 
         // these values are known during test-data generation
-        let block_height = 1644;
+        let block_height = 233;
         let tx_index = 2;
 
         let strata_checkpoint_tx = blocks

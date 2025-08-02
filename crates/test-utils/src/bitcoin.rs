@@ -12,14 +12,17 @@ use bitcoin::{
     transaction::Version,
     Amount, OutPoint, ScriptBuf, Sequence, TapSighashType, Transaction, TxIn, TxOut, Txid, Witness,
 };
+use bitcoind_async_client::{
+    types::{ListUnspent, SignRawTransactionWithWallet},
+    Client as BitcoinClient,
+};
 use corepc_node::{serde_json::json, Client, Node};
 use musig2::secp256k1::{schnorr, Message};
+use secp256k1::PublicKey;
 use strata_bridge_primitives::secp::EvenSecretKey;
-use strata_btcio::rpc::{
-    types::{ListUnspent, SignRawTransactionWithWallet},
-    BitcoinClient,
-};
+use tracing::{debug, trace};
 
+/// Gets a Bitcoin Core RPC client.
 pub fn get_client_async(bitcoind: &Node) -> BitcoinClient {
     // setting the ENV variable `BITCOIN_XPRIV_RETRIEVABLE` to retrieve the xpriv
     env::set_var("BITCOIN_XPRIV_RETRIEVABLE", "true");
@@ -35,6 +38,7 @@ fn get_auth(bitcoind: &Node) -> (String, String) {
     (cookie_values.user, cookie_values.password)
 }
 
+/// Generates a random transaction ID.
 pub fn generate_txid() -> Txid {
     let mut txid = [0u8; 32];
     OsRng.fill(&mut txid);
@@ -42,6 +46,7 @@ pub fn generate_txid() -> Txid {
     Txid::from_slice(&txid).expect("should be able to generate arbitrary txid")
 }
 
+/// Generates a random outpoint.
 pub fn generate_outpoint() -> bitcoin::OutPoint {
     let vout: u32 = OsRng.gen();
 
@@ -51,6 +56,7 @@ pub fn generate_outpoint() -> bitcoin::OutPoint {
     }
 }
 
+/// Generates a random signature.
 pub fn generate_signature() -> Signature {
     let mut sig = [0u8; 64];
     OsRng.fill(&mut sig);
@@ -58,19 +64,44 @@ pub fn generate_signature() -> Signature {
     Signature::from_slice(&sig).expect("should be able to generate arbitrary signature")
 }
 
-/// Generates a [`Keypair`] that is always guaranteed to have an even X-only public key.
+/// Generates a random keypair that is guaranteed to be of even parity.
 pub fn generate_keypair() -> Keypair {
-    let mut rng = thread_rng();
-    let sk = SecretKey::new(&mut rng);
+    let sk = SecretKey::new(&mut OsRng);
     let sk: EvenSecretKey = sk.into();
+
     Keypair::from_secret_key(SECP256K1, &sk)
 }
 
-pub fn generate_xonly_pubkey() -> XOnlyPublicKey {
-    let keypair = Keypair::new(SECP256K1, &mut OsRng);
-    XOnlyPublicKey::from_keypair(&keypair).0
+/// Generate `count` (public key, private key) pairs as two separate [`Vec`].
+pub fn generate_keypairs(count: usize) -> (Vec<PublicKey>, Vec<SecretKey>) {
+    let mut secret_keys: Vec<SecretKey> = Vec::with_capacity(count);
+    let mut pubkeys: Vec<PublicKey> = Vec::with_capacity(count);
+
+    let mut pubkeys_set: HashSet<PublicKey> = HashSet::new();
+
+    while pubkeys_set.len() != count {
+        let sk = SecretKey::new(&mut OsRng);
+        let keypair = Keypair::from_secret_key(SECP256K1, &sk);
+        let pubkey = PublicKey::from_keypair(&keypair);
+
+        if pubkeys_set.insert(pubkey) {
+            secret_keys.push(sk);
+            pubkeys.push(pubkey);
+        }
+    }
+
+    (pubkeys, secret_keys)
 }
 
+/// Generates a random x-only public key.
+pub fn generate_xonly_pubkey() -> XOnlyPublicKey {
+    let mut rng = thread_rng();
+    let sk = SecretKey::new(&mut rng);
+    let even_sk: EvenSecretKey = sk.into();
+    even_sk.x_only_public_key(SECP256K1).0
+}
+
+/// Generates a random transaction.
 pub fn generate_tx(num_inputs: usize, num_outputs: usize) -> Transaction {
     let inputs = (0..num_inputs)
         .map(|_| TxIn {
@@ -100,6 +131,7 @@ pub fn generate_tx(num_inputs: usize, num_outputs: usize) -> Transaction {
     }
 }
 
+/// Finds a funding UTXO for a transaction.
 pub fn find_funding_utxo(
     btc_client: &Client,
     ignore_list: HashSet<OutPoint>,
@@ -133,6 +165,7 @@ pub fn find_funding_utxo(
         .expect("must have a utxo with enough funds")
 }
 
+/// Gets a funding UTXO for a transaction with an exact amount.
 pub fn get_funding_utxo_exact(btc_client: &Client, target_amount: Amount) -> (TxOut, OutPoint) {
     let funding_address = btc_client
         .new_address()
@@ -170,6 +203,7 @@ pub fn get_funding_utxo_exact(btc_client: &Client, target_amount: Amount) -> (Tx
     (txout, outpoint)
 }
 
+/// Signs a child transaction for CPFP.
 pub fn sign_cpfp_child(
     btc_client: &Client,
     keypair: &Keypair,
@@ -208,6 +242,7 @@ pub fn sign_cpfp_child(
     (funding_witness, parent_signature)
 }
 
+/// Waits for a given number of blocks to be mined.
 pub fn wait_for_blocks(btc_client: &Client, count: usize) {
     let random_address = btc_client
         .new_address()
@@ -219,6 +254,33 @@ pub fn wait_for_blocks(btc_client: &Client, count: usize) {
             .generate_to_address(chunk, &random_address)
             .expect("must be able to generate blocks");
     });
+}
+
+/// Waits for a given height to be reached.
+// This is disabled because it is merely a testing helper function to ensure tests complete in
+// a timely manner, so we don't want lack of full coverage in this function to distract from
+// overall coverage.
+#[coverage(off)]
+pub async fn wait_for_height(
+    rpc_client: &corepc_node::Node,
+    height: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    debug!(%height, "waiting for target height");
+    Ok(
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let current_block_height = rpc_client.client.get_blockchain_info().unwrap().blocks;
+                if current_block_height < height as i64 {
+                    trace!(%current_block_height, target_block_height=%height, "waiting for target height");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                } else {
+                    trace!(%current_block_height, target_block_height=%height, "target height reached");
+                    break;
+                }
+            }
+        })
+        .await?,
+    )
 }
 
 #[cfg(test)]

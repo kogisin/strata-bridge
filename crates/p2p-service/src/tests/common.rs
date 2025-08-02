@@ -31,6 +31,7 @@ pub(crate) struct Operator {
 }
 
 impl Operator {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         keypair: SecpKeypair,
         allowlist: Vec<PeerId>,
@@ -38,14 +39,21 @@ impl Operator {
         local_addr: Multiaddr,
         cancel: CancellationToken,
         signers_allowlist: Vec<P2POperatorPubKey>,
+        dial_timeout: Option<Duration>,
+        general_timeout: Option<Duration>,
+        connection_check_interval: Option<Duration>,
     ) -> anyhow::Result<Self> {
         let config = P2PConfig {
             keypair: keypair.clone(),
             idle_connection_timeout: Duration::from_secs(30),
+            max_retries: Some(5),
             listening_addr: local_addr,
             allowlist,
             connect_to,
             signers_allowlist,
+            dial_timeout,
+            general_timeout,
+            connection_check_interval,
         };
 
         let swarm = swarm::with_inmemory_transport(&config)?;
@@ -100,6 +108,9 @@ impl Setup {
                 addr.clone(),
                 cancel.child_token(),
                 signers_allowlist.clone(),
+                Some(Duration::from_millis(250)),
+                Some(Duration::from_millis(250)),
+                Some(Duration::from_millis(500)),
             )?;
 
             operators.push(operator);
@@ -148,6 +159,9 @@ impl Setup {
                 addr.clone(),
                 cancel.child_token(),
                 signers_allowlist.clone(),
+                Some(Duration::from_millis(250)),
+                Some(Duration::from_millis(250)),
+                Some(Duration::from_millis(500)),
             )?;
 
             operators.push(operator);
@@ -211,6 +225,8 @@ impl Setup {
 pub(crate) fn mock_stake_chain_info(kp: &SecpKeypair, stake_chain_id: StakeChainId) -> Command {
     let kind = UnsignedPublishMessage::StakeChainExchange {
         stake_chain_id,
+        // some random point
+        operator_pk: XOnlyPublicKey::from_slice(&[2u8; 32]).unwrap(),
         pre_stake_txid: Txid::all_zeros(),
         pre_stake_vout: 0,
     };

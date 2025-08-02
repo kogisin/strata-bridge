@@ -1,4 +1,14 @@
-use bitcoin::{Amount, Txid};
+//! Constructs the assert chain.
+
+use core::fmt;
+use std::{marker::PhantomData, mem::MaybeUninit};
+
+use bitcoin::Txid;
+use serde::{
+    de::{SeqAccess, Visitor},
+    ser::SerializeTuple,
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use strata_bridge_connectors::prelude::*;
 use strata_bridge_primitives::constants::*;
 use tracing::trace;
@@ -8,7 +18,10 @@ use super::prelude::*;
 /// Data needed to construct an [`AssertChain`].
 #[derive(Debug, Clone)]
 pub struct AssertChainData {
+    /// The data for the pre-assert transaction.
     pub pre_assert_data: PreAssertData,
+
+    /// The txid of the deposit UTXO that can be withdrawn via this withdrawal fulfillment.
     pub deposit_txid: Txid,
 }
 
@@ -59,9 +72,18 @@ impl AssertChain {
         let pre_assert_txid = pre_assert.compute_txid();
         trace!(event = "created pre-assert tx", %pre_assert_txid);
 
+        let pre_assert_locking_scripts = pre_assert
+            .tx_outs()
+            .into_iter()
+            .map(|txout| txout.script_pubkey)
+            .take(NUM_ASSERT_DATA_TX)
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("pre-assert transaction must have the right number of outputs");
+
         let assert_data_input = AssertDataTxInput {
             pre_assert_txid,
-            pre_assert_txouts: pre_assert.tx_outs(),
+            pre_assert_locking_scripts,
         };
 
         trace!(event = "constructed assert data input", ?assert_data_input);
@@ -70,17 +92,8 @@ impl AssertChain {
         let assert_data_txids = assert_data.compute_txids().to_vec();
         trace!(event = "created assert_data tx batch", ?assert_data_txids);
 
-        let input_amount = assert_data
-            .psbts()
-            .iter()
-            .fold(Amount::from_sat(0), |acc, psbt| {
-                acc + psbt.unsigned_tx.output[0].value
-            });
-
         let post_assert_data = PostAssertTxData {
             assert_data_txids,
-            pre_assert_txid,
-            input_amount,
             deposit_txid: data.deposit_txid,
         };
 
@@ -95,4 +108,92 @@ impl AssertChain {
             post_assert,
         }
     }
+}
+
+/// This is needed because the blanket implementation of serde's deserializers doesn't go past fixed
+/// length arrays of larger than 32.
+pub fn serialize_assert_vector<T: Serialize, S: Serializer>(
+    data: &[T; NUM_ASSERT_DATA_TX],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let mut seq = serializer.serialize_tuple(NUM_ASSERT_DATA_TX)?;
+    for e in data {
+        seq.serialize_element(e)?;
+    }
+    seq.end()
+}
+
+/// This is needed because the blanket implementation of serde's deserializers doesn't go past fixed
+/// length arrays of larger than 32.
+pub fn deserialize_assert_vector<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<[T; NUM_ASSERT_DATA_TX], D::Error> {
+    // The api design of serde completely lacks any sort of taste so we're forced to specify all of
+    // this bullshit.
+    struct AssertVisitor<const N: usize, T> {
+        marker: PhantomData<T>,
+    }
+
+    impl<'de, const N: usize, T> Visitor<'de> for AssertVisitor<N, T>
+    where
+        T: Deserialize<'de>,
+    {
+        type Value = [T; N];
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a sequence")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = [const { MaybeUninit::<T>::uninit() }; N];
+            let mut num_successfully_deserialized = 0;
+
+            let cleanup = |mut vs: [MaybeUninit<T>; N], n: usize| {
+                for written in &mut vs[..n] {
+                    unsafe {
+                        written.assume_init_drop();
+                    }
+                }
+            };
+
+            while let Some(res) = seq.next_element().transpose() {
+                match res {
+                    Ok(value) => {
+                        if num_successfully_deserialized >= NUM_ASSERT_DATA_TX {
+                            cleanup(values, num_successfully_deserialized);
+                            return Err(serde::de::Error::invalid_length(
+                                num_successfully_deserialized + 1,
+                                &self,
+                            ));
+                        }
+
+                        values[num_successfully_deserialized].write(value);
+                        num_successfully_deserialized += 1;
+                    }
+                    Err(e) => {
+                        cleanup(values, num_successfully_deserialized);
+                        return Err(e);
+                    }
+                }
+            }
+
+            if num_successfully_deserialized < NUM_ASSERT_DATA_TX {
+                cleanup(values, num_successfully_deserialized);
+                Err(serde::de::Error::invalid_length(
+                    num_successfully_deserialized,
+                    &self,
+                ))
+            } else {
+                Ok(unsafe { MaybeUninit::array_assume_init(values) })
+            }
+        }
+    }
+
+    let visitor = AssertVisitor::<NUM_ASSERT_DATA_TX, T> {
+        marker: PhantomData,
+    };
+    deserializer.deserialize_seq(visitor)
 }

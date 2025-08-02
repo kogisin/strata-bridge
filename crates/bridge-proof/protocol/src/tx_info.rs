@@ -1,6 +1,7 @@
+use alpen_bridge_params::types::Tag;
 use bitcoin::{consensus, ScriptBuf, Transaction, Txid};
 use strata_crypto::groth16_verifier::verify_rollup_groth16_proof_receipt;
-use strata_l1tx::{envelope::parser::parse_envelope_payloads, filter::TxFilterConfig};
+use strata_l1tx::{envelope::parser::parse_envelope_payloads, filter::types::TxFilterConfig};
 use strata_primitives::{
     batch::SignedCheckpoint, bridge::OperatorIdx, l1::BitcoinAmount, params::RollupParams,
 };
@@ -16,8 +17,8 @@ pub(crate) fn extract_valid_chainstate_from_checkpoint(
         .map_err(|e| BridgeProofError::InvalidParams(e.to_string()))?;
 
     for inp in &tx.input {
-        if let Some(scr) = inp.witness.tapscript() {
-            if let Ok(payload) = parse_envelope_payloads(&scr.into(), &filter_config) {
+        if let Some(scr) = inp.witness.taproot_leaf_script() {
+            if let Ok(payload) = parse_envelope_payloads(&scr.script.into(), &filter_config) {
                 if payload.is_empty() {
                     continue;
                 }
@@ -61,6 +62,7 @@ pub(crate) fn extract_valid_chainstate_from_checkpoint(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WithdrawalInfo {
+    pub(crate) tag: Tag,
     pub(crate) operator_idx: OperatorIdx,
     pub(crate) deposit_idx: u32,
     pub(crate) deposit_txid: Txid,
@@ -71,10 +73,14 @@ pub(crate) struct WithdrawalInfo {
 // TODO: make this standard
 pub(crate) fn extract_withdrawal_info(
     tx: &Transaction,
+    expected_tag: Tag,
 ) -> Result<WithdrawalInfo, BridgeProofError> {
     if tx.output.len() < 2 {
         return Err(BridgeProofError::TxInfoExtractionError(
-            BridgeRelatedTx::WithdrawalFulfillment,
+            BridgeRelatedTx::WithdrawalFulfillment(format!(
+                "outputs less than 2, got: {}",
+                tx.output.len()
+            )),
         ));
     }
 
@@ -82,34 +88,81 @@ pub(crate) fn extract_withdrawal_info(
     let withdrawal_metadata_output = &tx.output[1];
 
     let metadata_script = withdrawal_metadata_output.script_pubkey.as_bytes();
-    const EXPECTED_METADATA_SIZE: usize = 2 + 4 + 4 + 32; // OP_RETURN + OP_PUSHBYTES + operator_id + deposit_id + deposit_txid
-    if metadata_script.len() != EXPECTED_METADATA_SIZE {
+
+    const OP_RETURN_INSTRUCTION_SIZE: usize = 2; // OP_RETURN + OP_PUSHBYTES
+    const TAG_SIZE: usize = Tag::size();
+    const OPERATOR_IDX_SIZE: usize = std::mem::size_of::<OperatorIdx>();
+    const DEPOSIT_IDX_SIZE: usize = std::mem::size_of::<u32>();
+    const DEPOSIT_TXID_SIZE: usize = std::mem::size_of::<Txid>();
+
+    let expected_metadata_size: usize = OP_RETURN_INSTRUCTION_SIZE
+        + TAG_SIZE
+        + OPERATOR_IDX_SIZE
+        + DEPOSIT_IDX_SIZE
+        + DEPOSIT_TXID_SIZE;
+
+    if metadata_script.len() != expected_metadata_size {
         return Err(BridgeProofError::TxInfoExtractionError(
-            BridgeRelatedTx::WithdrawalFulfillment,
+            BridgeRelatedTx::WithdrawalFulfillment(format!(
+                "metadata script size mismatch, expected: {}, got: {}",
+                expected_metadata_size,
+                metadata_script.len()
+            )),
         ));
     }
 
-    let operator_idx_bytes = &metadata_script[2..6];
+    let mut offset = OP_RETURN_INSTRUCTION_SIZE;
 
-    let deposit_idx_bytes = &metadata_script[6..10];
-    let deposit_txid_bytes = &metadata_script[10..42];
+    let tag = Tag::try_from(&metadata_script[offset..offset + Tag::size()]).map_err(|_| {
+        BridgeProofError::TxInfoExtractionError(BridgeRelatedTx::WithdrawalFulfillment(format!(
+            "tag bytes conversion error, expected 4 bytes, got: {}",
+            metadata_script[offset..offset + Tag::size()].len()
+        )))
+    })?;
+
+    if tag != expected_tag {
+        return Err(BridgeProofError::TxInfoExtractionError(
+            BridgeRelatedTx::WithdrawalFulfillment(format!(
+                "tag mismatch, expected: {expected_tag}, got: {tag}"
+            )),
+        ));
+    }
+
+    offset += Tag::size();
+    let operator_idx_bytes = &metadata_script[offset..offset + OPERATOR_IDX_SIZE];
+
+    offset += OPERATOR_IDX_SIZE;
+    let deposit_idx_bytes = &metadata_script[offset..offset + DEPOSIT_IDX_SIZE];
+
+    offset += DEPOSIT_IDX_SIZE;
+    let deposit_txid_bytes = &metadata_script[offset..offset + DEPOSIT_TXID_SIZE];
 
     let operator_idx = u32::from_be_bytes(operator_idx_bytes.try_into().map_err(|_| {
-        BridgeProofError::TxInfoExtractionError(BridgeRelatedTx::WithdrawalFulfillment)
+        BridgeProofError::TxInfoExtractionError(BridgeRelatedTx::WithdrawalFulfillment(format!(
+            "operator_idx bytes conversion error, expected 4 bytes, got: {}",
+            operator_idx_bytes.len()
+        )))
     })?);
 
     let deposit_idx = u32::from_be_bytes(deposit_idx_bytes.try_into().map_err(|_| {
-        BridgeProofError::TxInfoExtractionError(BridgeRelatedTx::WithdrawalFulfillment)
+        BridgeProofError::TxInfoExtractionError(BridgeRelatedTx::WithdrawalFulfillment(format!(
+            "deposit_idx bytes conversion error, expected 4 bytes, got: {}",
+            deposit_idx_bytes.len()
+        )))
     })?);
 
     let deposit_txid: Txid = consensus::encode::deserialize(deposit_txid_bytes).map_err(|_| {
-        BridgeProofError::TxInfoExtractionError(BridgeRelatedTx::WithdrawalFulfillment)
+        BridgeProofError::TxInfoExtractionError(BridgeRelatedTx::WithdrawalFulfillment(format!(
+            "deposit_txid bytes conversion error, expected 32 bytes, got: {}",
+            deposit_txid_bytes.len()
+        )))
     })?;
 
     let withdrawal_amount = BitcoinAmount::from_sat(withdrawal_fulfillment_output.value.to_sat());
     let withdrawal_address = withdrawal_fulfillment_output.script_pubkey.clone();
 
     Ok(WithdrawalInfo {
+        tag,
         operator_idx,
         deposit_idx,
         deposit_txid,
@@ -120,12 +173,13 @@ pub(crate) fn extract_withdrawal_info(
 
 #[cfg(test)]
 mod tests {
+    use alpen_bridge_params::prelude::PegOutGraphParams;
     use bitcoin::hashes::Hash;
     use prover_test_utils::{
         extract_test_headers, get_strata_checkpoint_tx, get_withdrawal_fulfillment_tx,
         load_test_rollup_params,
     };
-    use strata_common::logging::{self, LoggerConfig};
+    use strata_bridge_common::logging::{self, LoggerConfig};
     use strata_proofimpl_btc_blockspace::tx::compute_txid;
     use tracing::info;
 
@@ -141,6 +195,7 @@ mod tests {
         let checkpoint_inscribed_tx = checkpoint_inscribed_tx_bundle.transaction();
 
         let rollup_params = load_test_rollup_params();
+        let _tag = Tag::try_from(rollup_params.rollup_name.clone()).unwrap();
         let res = extract_valid_chainstate_from_checkpoint(checkpoint_inscribed_tx, &rollup_params);
         assert!(
             res.is_ok(),
@@ -154,6 +209,7 @@ mod tests {
         logging::init(LoggerConfig::new(
             "test-extract-withdrawal-info".to_string(),
         ));
+        let peg_out_graph_params = PegOutGraphParams::default();
         let headers = extract_test_headers();
         let (withdrawal_fulfillment_tx_bundle, idx) = get_withdrawal_fulfillment_tx();
         assert!(withdrawal_fulfillment_tx_bundle.verify(headers[idx]));
@@ -175,7 +231,7 @@ mod tests {
             "custom computed txid must match rust-bitcoin computed txid"
         );
 
-        let res = extract_withdrawal_info(withdrawal_fulfillment_tx);
+        let res = extract_withdrawal_info(withdrawal_fulfillment_tx, peg_out_graph_params.tag);
         assert!(
             res.is_ok(),
             "must be able to extract withdrawal info but got {:?}",

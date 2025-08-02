@@ -1,4 +1,9 @@
-use bitcoin::{sighash::Prevouts, transaction, Amount, OutPoint, Psbt, Transaction, TxOut, Txid};
+//! Constructs the post-assert transaction.
+
+use bitcoin::{
+    sighash::Prevouts, transaction, Amount, OutPoint, Psbt, TapSighashType, Transaction, TxOut,
+    Txid,
+};
 use secp256k1::schnorr::Signature;
 use serde::{Deserialize, Serialize};
 use strata_bridge_connectors::prelude::*;
@@ -13,15 +18,12 @@ pub struct PostAssertTxData {
     /// The transaction IDs of the assert data transactions in order.
     pub assert_data_txids: Vec<Txid>,
 
-    /// The transaction ID of the pre-assert transaction used to carry the stake over.
-    pub pre_assert_txid: Txid,
-
-    /// The amount of the stake that was carried over after paying transaction fees.
-    pub input_amount: Amount,
-
     /// The transaction ID of the deposit transaction.
     pub deposit_txid: Txid,
 }
+
+/// The number of inputs that require an $N$-of-$N$ signature in the [`PostAssertTx`].
+pub const NUM_POST_ASSERT_INPUTS: usize = NUM_ASSERT_DATA_TX;
 
 /// A transaction in the Assert chain that combines the outputs of the assert data transactions.
 ///
@@ -33,9 +35,9 @@ pub struct PostAssertTx {
 
     output_amount: Amount,
 
-    prevouts: Vec<TxOut>,
+    prevouts: [TxOut; NUM_POST_ASSERT_INPUTS],
 
-    witnesses: Vec<TaprootWitness>,
+    witnesses: [TaprootWitness; NUM_POST_ASSERT_INPUTS],
 }
 
 impl PostAssertTx {
@@ -46,6 +48,9 @@ impl PostAssertTx {
         connector_a3: ConnectorA3,
         connector_cpfp: ConnectorCpfp,
     ) -> Self {
+        // all the dust outputs from assert-data transactions
+        let input_amount: Amount = SEGWIT_MIN_AMOUNT * NUM_ASSERT_DATA_TX as u64;
+
         let mut utxos = Vec::with_capacity(NUM_ASSERT_DATA_TX);
         utxos.extend(data.assert_data_txids.iter().map(|txid| OutPoint {
             txid: *txid,
@@ -56,7 +61,7 @@ impl PostAssertTx {
 
         trace!(event = "created tx ins", count = tx_ins.len());
 
-        let connector_a31_script = connector_a3.generate_locking_script(data.deposit_txid);
+        let connector_a31_script = connector_a3.generate_locking_script();
         trace!(
             event = "generated a31 locking script",
             size = connector_a31_script.len(),
@@ -65,7 +70,7 @@ impl PostAssertTx {
         let cpfp_script = connector_cpfp.generate_locking_script();
         let cpfp_amount = cpfp_script.minimal_non_dust();
 
-        let net_amount = data.input_amount - cpfp_amount;
+        let net_amount = input_amount - cpfp_amount;
         let scripts_and_amounts = [
             (connector_a31_script.clone(), net_amount),
             (cpfp_script, cpfp_amount),
@@ -81,20 +86,24 @@ impl PostAssertTx {
 
         let assert_data_output_script = connector_a2.create_taproot_address().script_pubkey();
 
-        let prevouts = (0..NUM_ASSERT_DATA_TX)
-            .map(|_| TxOut {
+        let prevouts: [TxOut; NUM_ASSERT_DATA_TX] = vec![
+            TxOut {
                 script_pubkey: assert_data_output_script.clone(),
                 value: assert_data_output_script.minimal_non_dust(),
-            })
-            .collect::<Vec<TxOut>>();
-
-        trace!(event = "created prevouts", count = prevouts.len());
+            };
+            NUM_ASSERT_DATA_TX
+        ]
+        .try_into()
+        .expect("vec must have exactly NUM_ASSERT_DATA_TX elements");
 
         for (input, utxo) in psbt.inputs.iter_mut().zip(prevouts.clone()) {
             input.witness_utxo = Some(utxo);
+            input.sighash_type = Some(TapSighashType::Default.into());
         }
 
-        let witnesses = vec![TaprootWitness::Key; NUM_ASSERT_DATA_TX];
+        let witnesses = vec![TaprootWitness::Key; NUM_ASSERT_DATA_TX]
+            .try_into()
+            .expect("vec must have exactly NUM_ASSERT_DATA_TX elements");
 
         Self {
             psbt,
@@ -106,11 +115,12 @@ impl PostAssertTx {
     }
 
     /// Returns the remaining stake after the post-assert transaction.
-    pub fn output_amount(&self) -> Amount {
+    pub const fn output_amount(&self) -> Amount {
         self.output_amount
     }
 
-    pub fn cpfp_vout(&self) -> u32 {
+    /// Returns the output index of the CPFP output.
+    pub const fn cpfp_vout(&self) -> u32 {
         self.psbt.outputs.len() as u32 - 1
     }
 
@@ -129,7 +139,7 @@ impl PostAssertTx {
     }
 }
 
-impl CovenantTx for PostAssertTx {
+impl CovenantTx<NUM_POST_ASSERT_INPUTS> for PostAssertTx {
     fn psbt(&self) -> &Psbt {
         &self.psbt
     }
@@ -142,7 +152,7 @@ impl CovenantTx for PostAssertTx {
         Prevouts::All(&self.prevouts)
     }
 
-    fn witnesses(&self) -> &[TaprootWitness] {
+    fn witnesses(&self) -> &[TaprootWitness; NUM_ASSERT_DATA_TX] {
         &self.witnesses
     }
 

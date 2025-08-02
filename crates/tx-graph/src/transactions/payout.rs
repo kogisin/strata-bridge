@@ -1,3 +1,5 @@
+//! Constructs the payout transaction.
+
 use bitcoin::{
     sighash::Prevouts, taproot, transaction, Amount, Network, OutPoint, Psbt, Sequence,
     TapSighashType, Transaction, TxOut, Txid,
@@ -7,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use strata_bridge_connectors::prelude::{
     ConnectorA3, ConnectorA3Leaf, ConnectorCpfp, ConnectorNOfN, ConnectorP, StakeSpendPath,
 };
-use strata_bridge_primitives::scripts::prelude::*;
+use strata_bridge_primitives::{
+    constants::{NUM_ASSERT_DATA_TX, SEGWIT_MIN_AMOUNT},
+    scripts::prelude::*,
+};
 
 use super::covenant_tx::CovenantTx;
 
@@ -26,10 +31,6 @@ pub struct PayoutData {
     /// The [`OutPoint`] of the stake transaction.
     pub stake_outpoint: OutPoint,
 
-    /// The amount that remains after paying off the transaction fees in the preceding
-    /// transactions.
-    pub input_amount: Amount,
-
     /// The amount of the deposit.
     ///
     /// This is the amount held in a particular UTXO in the Bridge Address used to reimburse the
@@ -44,25 +45,34 @@ pub struct PayoutData {
     pub network: Network,
 }
 
+/// The number of inputs that require an $N$-of-$N$ signature in the [`PayoutTx`].
+pub const NUM_PAYOUT_INPUTS: usize = 4;
+
 /// A transaction that reimburses a *functional* operator.
 #[derive(Debug, Clone)]
 pub struct PayoutTx {
     psbt: Psbt,
 
-    prevouts: Vec<TxOut>,
+    prevouts: [TxOut; NUM_PAYOUT_INPUTS],
 
-    witnesses: Vec<TaprootWitness>,
+    witnesses: [TaprootWitness; NUM_PAYOUT_INPUTS],
+
+    connector_n_of_n: ConnectorNOfN,
+    connector_p: ConnectorP,
 }
 
 impl PayoutTx {
     /// Constructs a new instance of the payout transaction.
     pub fn new(
         data: PayoutData,
-        connector_a3: ConnectorA3,
+        connector_a3: &ConnectorA3,
         connector_n_of_n: ConnectorNOfN,
         connector_p: ConnectorP,
         connector_cpfp: ConnectorCpfp,
     ) -> Self {
+        // 1 dust output is used for cpfp-ing the post-assert transaction itself.
+        let input_from_post_assert: Amount = SEGWIT_MIN_AMOUNT * (NUM_ASSERT_DATA_TX - 1) as u64;
+
         let utxos = [
             OutPoint {
                 txid: data.deposit_txid,
@@ -98,14 +108,14 @@ impl PayoutTx {
         let cpfp_amount = cpfp_script.minimal_non_dust();
 
         let n_of_n_addr = connector_n_of_n.create_taproot_address();
-        let prevouts = vec![
+        let prevouts = [
             TxOut {
                 value: data.deposit_amount,
                 script_pubkey: n_of_n_addr.script_pubkey(),
             },
             TxOut {
-                value: data.input_amount,
-                script_pubkey: connector_a3.generate_locking_script(data.deposit_txid),
+                value: input_from_post_assert,
+                script_pubkey: connector_a3.generate_locking_script(),
             },
             TxOut {
                 value: n_of_n_addr.script_pubkey().minimal_non_dust(),
@@ -134,11 +144,12 @@ impl PayoutTx {
 
         for (input, utxo) in psbt.inputs.iter_mut().zip(prevouts.clone()) {
             input.witness_utxo = Some(utxo);
+            input.sighash_type = Some(TapSighashType::Default.into());
         }
 
         let (connector_a3_script, connector_a3_control_block) =
-            connector_a3.generate_spend_info(ConnectorA3Leaf::Payout(None), data.deposit_txid);
-        let witnesses = vec![
+            connector_a3.generate_spend_info(ConnectorA3Leaf::Payout(None));
+        let witnesses = [
             TaprootWitness::Key,
             TaprootWitness::Script {
                 script_buf: connector_a3_script,
@@ -155,28 +166,25 @@ impl PayoutTx {
 
             prevouts,
             witnesses,
+
+            connector_n_of_n,
+            connector_p,
         }
     }
 
     /// Gets the output index for CPFP.
-    pub fn cpfp_vout(&self) -> u32 {
+    pub const fn cpfp_vout(&self) -> u32 {
         self.psbt.outputs.len() as u32 - 1
     }
 
     /// Finalizes the payout transaction.
-    ///
-    /// Note that the `deposit_signature` is also an n-of-n signature.
-    #[expect(clippy::too_many_arguments)]
     pub fn finalize(
         mut self,
-        deposit_signature: schnorr::Signature,
-        n_of_n_sig_a3: schnorr::Signature,
-        n_of_n_sig_c2: schnorr::Signature,
-        n_of_n_sig_p: schnorr::Signature,
         connector_a3: ConnectorA3,
-        connector_c2: ConnectorNOfN,
-        connector_p: ConnectorP,
+        aggregate_sigs: [schnorr::Signature; NUM_PAYOUT_INPUTS],
     ) -> Transaction {
+        let [deposit_signature, n_of_n_sig_a3, n_of_n_sig_c2, n_of_n_sig_p] = aggregate_sigs;
+
         finalize_input(&mut self.psbt.inputs[0], [deposit_signature.serialize()]);
 
         connector_a3.finalize_input(
@@ -188,10 +196,12 @@ impl PayoutTx {
             signature: n_of_n_sig_c2,
             sighash_type: TapSighashType::Default,
         };
-        connector_c2.finalize_input(&mut self.psbt.inputs[2], n_of_n_sig_c2);
+        self.connector_n_of_n
+            .finalize_input(&mut self.psbt.inputs[2], n_of_n_sig_c2);
 
         let spend_path = StakeSpendPath::Payout(n_of_n_sig_p);
-        connector_p.finalize(&mut self.psbt.inputs[3], spend_path);
+        self.connector_p
+            .finalize(&mut self.psbt.inputs[3], spend_path);
 
         self.psbt
             .extract_tx()
@@ -199,7 +209,7 @@ impl PayoutTx {
     }
 }
 
-impl CovenantTx for PayoutTx {
+impl CovenantTx<NUM_PAYOUT_INPUTS> for PayoutTx {
     fn psbt(&self) -> &Psbt {
         &self.psbt
     }
@@ -212,7 +222,7 @@ impl CovenantTx for PayoutTx {
         Prevouts::All(&self.prevouts)
     }
 
-    fn witnesses(&self) -> &[TaprootWitness] {
+    fn witnesses(&self) -> &[TaprootWitness; 4] {
         &self.witnesses
     }
 

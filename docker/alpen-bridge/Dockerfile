@@ -20,5 +20,6 @@ COPY --from=builder /app/migrations /app/migrations
 COPY docker/alpen-bridge/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 EXPOSE 5678
+EXPOSE 3000
 
 ENTRYPOINT ["sh", "/usr/local/bin/entrypoint.sh"]

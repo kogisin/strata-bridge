@@ -1,3 +1,6 @@
+//! Constructs and finalizes withdrawal fulfillment transactions.
+
+use alpen_bridge_params::types::Tag;
 use bitcoin::{consensus, Amount, OutPoint, Transaction, TxOut, Txid};
 use bitcoin_bosd::Descriptor;
 use strata_bridge_primitives::{
@@ -15,7 +18,7 @@ pub struct WithdrawalFulfillment(Transaction);
 #[derive(Debug, Clone)]
 pub struct WithdrawalMetadata {
     /// The tag used to mark the withdrawal metadata transaction.
-    pub tag: Vec<u8>,
+    pub tag: Tag,
 
     /// The index of the operator as per the information in the chain state in Strata.
     ///
@@ -46,12 +49,13 @@ pub struct WithdrawalMetadata {
 }
 
 impl WithdrawalMetadata {
+    /// Returns the op-return data for the withdrawal metadata.
     pub fn op_return_data(&self) -> Vec<u8> {
         let op_id_prefix: [u8; 4] = self.operator_idx.to_be_bytes();
         let deposit_id_prefix: [u8; 4] = self.deposit_idx.to_be_bytes();
         let deposit_txid_data = consensus::encode::serialize(&self.deposit_txid);
         [
-            self.tag.as_slice(),
+            self.tag.as_bytes(),
             &op_id_prefix[..],
             &deposit_id_prefix[..],
             &deposit_txid_data[..],
@@ -131,8 +135,8 @@ mod tests {
         // Set up parameters
         let network = Network::Regtest;
         let sender_outpoints = vec![generate_outpoint(), generate_outpoint()]; // Sample outpoints
-        let amount = Amount::from_sat(10000); // Recipient amount
-        let change_amount = Amount::from_sat(5000); // Change amount
+        let amount = Amount::from_sat(10_000); // Recipient amount
+        let change_amount = Amount::from_sat(5_000); // Change amount
         let recipient_key = generate_xonly_pubkey();
         let recipient_addr =
             Address::p2tr_tweaked(recipient_key.dangerous_assume_tweaked(), network);
@@ -152,7 +156,7 @@ mod tests {
         let deposit_idx: u32 = OsRng.gen();
         let deposit_txid = generate_txid();
 
-        let tag = b"test-tag".to_vec();
+        let tag = Tag::new(*b"alp0");
         let withdrawal_metadata = WithdrawalMetadata {
             tag,
             operator_idx,
@@ -194,7 +198,7 @@ mod tests {
             "Change output is missing or incorrect"
         );
 
-        let tag = withdrawal_metadata.tag.to_lower_hex_string();
+        let tag = withdrawal_metadata.tag.as_bytes().to_lower_hex_string();
         let operator_idx = withdrawal_metadata
             .operator_idx
             .to_be_bytes()
@@ -210,7 +214,7 @@ mod tests {
             second_output.value == op_return_amount
                 && second_output.script_pubkey.is_op_return()
                 && second_output.script_pubkey[2..].to_hex_string()
-                    == format!("{}{}{}{}", tag, operator_idx, deposit_idx, deposit_txid),
+                    == format!("{tag}{operator_idx}{deposit_idx}{deposit_txid}"),
             "OP_RETURN output is missing or invalid"
         );
     }

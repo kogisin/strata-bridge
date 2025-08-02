@@ -2,14 +2,16 @@
 //!
 //! These models rely on some common types in [`super::types`] module.
 
+use std::ops::Deref;
+
 use bitcoin::OutPoint;
 use sqlx::{self};
 use strata_bridge_stake_chain::transactions::stake::StakeTxData;
 
 use super::types::{
-    DbAmount, DbDutyStatus, DbHash, DbInputIndex, DbOperatorId, DbPartialSig, DbPubNonce,
-    DbScriptBuf, DbSecNonce, DbSignature, DbTransaction, DbTxid, DbWots256PublicKey,
-    DbWotsPublicKeys, DbWotsSignatures,
+    DbAggNonce, DbAmount, DbHash, DbInputIndex, DbOperatorIdx, DbPartialSig, DbPubNonce,
+    DbScriptBuf, DbSecNonce, DbSignature, DbTaprootWitness, DbTxid, DbWots256PublicKey,
+    DbWotsPublicKeys, DbWotsSignatures, DbXOnlyPublicKey,
 };
 
 /// The model for WOTS public keys stored in the database.
@@ -17,7 +19,7 @@ use super::types::{
 pub(super) struct WotsPublicKey {
     /// The ID of the operator stored as `INTEGER`.
     #[expect(dead_code)]
-    pub(super) operator_id: DbOperatorId,
+    pub(super) operator_idx: DbOperatorIdx,
 
     /// The hex-serialized deposit txid stored as `TEXT`.
     #[expect(dead_code)]
@@ -32,7 +34,7 @@ pub(super) struct WotsPublicKey {
 pub(super) struct WotsSignature {
     /// The ID of the operator stored as `INTEGER`.
     #[expect(dead_code)]
-    pub(super) operator_id: DbOperatorId,
+    pub(super) operator_idx: DbOperatorIdx,
 
     /// The hex-serialized deposit txid stored as `TEXT`.
     #[expect(dead_code)]
@@ -47,7 +49,7 @@ pub(super) struct WotsSignature {
 pub(super) struct Signature {
     /// The ID of the operator stored as `INTEGER`.
     #[expect(dead_code)]
-    pub(super) operator_id: DbOperatorId,
+    pub(super) operator_idx: DbOperatorIdx,
 
     // The hex-serialized transaction ID.
     #[expect(dead_code)]
@@ -63,6 +65,9 @@ pub(super) struct Signature {
 
 /// The model for tracking the stake information.
 pub(super) struct DbStakeTxData {
+    /// The index of the deposit.
+    pub(super) deposit_idx: u32,
+
     /// The txid of the transaction used to fund the dust outputs.
     pub(super) funding_txid: DbTxid,
 
@@ -74,15 +79,20 @@ pub(super) struct DbStakeTxData {
 
     /// The WOTS public key used to commit to the withdrawal fulfillment transaction.
     pub(super) withdrawal_fulfillment_pk: DbWots256PublicKey,
+
+    /// The public key of the operator that is used to lock the stake.
+    pub(super) operator_pubkey: DbXOnlyPublicKey,
 }
 
-impl From<StakeTxData> for DbStakeTxData {
-    fn from(stake_tx_data: StakeTxData) -> Self {
+impl DbStakeTxData {
+    pub(crate) fn new(deposit_idx: u32, stake_tx_data: StakeTxData) -> Self {
         Self {
+            deposit_idx,
             funding_txid: stake_tx_data.operator_funds.txid.into(),
             funding_vout: stake_tx_data.operator_funds.vout.into(),
             hash: stake_tx_data.hash.into(),
             withdrawal_fulfillment_pk: stake_tx_data.withdrawal_fulfillment_pk.into(),
+            operator_pubkey: stake_tx_data.operator_pubkey.into(),
         }
     }
 }
@@ -95,31 +105,10 @@ impl From<DbStakeTxData> for StakeTxData {
                 vout: *db_stake_tx_data.funding_vout,
             },
             hash: *db_stake_tx_data.hash,
-            withdrawal_fulfillment_pk: *db_stake_tx_data.withdrawal_fulfillment_pk,
+            withdrawal_fulfillment_pk: db_stake_tx_data.withdrawal_fulfillment_pk.deref().clone(),
+            operator_pubkey: *db_stake_tx_data.operator_pubkey,
         }
     }
-}
-
-/// The model for tracking duty statuses.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub(super) struct DutyTracker {
-    /// The ID of the duty stored as `TEXT`.
-    #[expect(dead_code)]
-    pub(super) duty_id: DbTxid,
-
-    /// The status of the duty stored as a JSON string.
-    pub(super) status: DbDutyStatus,
-}
-
-/// The model to track relevant transactions.
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub(super) struct RelevantTxIndex {
-    /// The hex-serialized transaction ID.
-    #[expect(dead_code)]
-    pub(super) txid: DbTxid,
-
-    /// The hex-serialized block hash.
-    pub(super) tx: DbTransaction,
 }
 
 /// The model to map claims to operators and deposit.
@@ -133,7 +122,7 @@ pub(super) struct ClaimToOperatorAndDeposit {
     pub(super) deposit_txid: DbTxid,
 
     /// The ID of the operator stored as `INTEGER`.
-    pub(super) operator_id: DbOperatorId,
+    pub(super) operator_idx: DbOperatorIdx,
 }
 
 /// The model to map post-assert txid to operators and deposit.
@@ -147,7 +136,7 @@ pub(super) struct PostAssertToOperatorAndDeposit {
     pub(super) deposit_txid: DbTxid,
 
     /// The ID of the operator stored as `INTEGER`.
-    pub(super) operator_id: DbOperatorId,
+    pub(super) operator_idx: DbOperatorIdx,
 }
 
 /// The model to map assert-data txids to operators and deposit.
@@ -161,7 +150,7 @@ pub(super) struct AssertDataToOperatorAndDeposit {
     pub(super) deposit_txid: DbTxid,
 
     /// The ID of the operator stored as `INTEGER`.
-    pub(super) operator_id: DbOperatorId,
+    pub(super) operator_idx: DbOperatorIdx,
 }
 
 /// The model to map pre-assert txids to operators and deposit.
@@ -175,12 +164,16 @@ pub(super) struct PreAssertToOperatorAndDeposit {
     pub(super) deposit_txid: DbTxid,
 
     /// The ID of the operator stored as `INTEGER`.
-    pub(super) operator_id: DbOperatorId,
+    pub(super) operator_idx: DbOperatorIdx,
 }
 
 /// The model to map pubnonces to operators and deposit.
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub(super) struct CollectedPubnonces {
+pub(super) struct PubNonces {
+    /// The ID of the operator stored as `INTEGER`.
+    #[expect(dead_code)]
+    pub(super) operator_idx: DbOperatorIdx,
+
     /// The hex-serialized txid.
     #[expect(dead_code)]
     pub(super) txid: DbTxid,
@@ -189,36 +182,65 @@ pub(super) struct CollectedPubnonces {
     #[expect(dead_code)]
     pub(super) input_index: DbInputIndex,
 
-    /// The ID of the operator stored as `INTEGER`.
-    pub(super) operator_id: DbOperatorId,
-
     /// The hex-serialized pubnonce.
     pub(super) pubnonce: DbPubNonce,
 }
 
-/// The model to map secnonces to operators and deposit.
+/// The model to map aggregated nonces (without operator_id).
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub(super) struct Secnonces {
+pub(super) struct AggregatedNonces {
     /// The hex-serialized txid.
     #[expect(dead_code)]
     pub(super) txid: DbTxid,
 
     /// The index of the input in the bitcoin transaction.
     #[expect(dead_code)]
+    pub(super) input_index: DbInputIndex,
+
+    /// The hex-serialized aggregated nonce.
+    pub(super) agg_nonce: DbAggNonce,
+}
+
+/// The model to map secnonces to operators and deposit.
+#[derive(Debug, Clone, sqlx::FromRow)]
+#[expect(dead_code)]
+pub(super) struct Secnonces {
+    /// The hex-serialized txid.
+    pub(super) txid: DbTxid,
+
+    /// The index of the input in the bitcoin transaction.
     pub(super) input_index: DbInputIndex,
 
     /// The hex-serialized secnonce.
     pub(super) secnonce: DbSecNonce,
 }
 
+/// The model to map witnesses to operators.
+#[derive(Debug, Clone, sqlx::FromRow)]
+#[expect(dead_code)]
+pub(super) struct Witnesses {
+    /// The ID of the operator stored as `INTEGER`.
+    pub(super) operator_idx: DbOperatorIdx,
+
+    /// The hex-serialized txid.
+    pub(super) txid: DbTxid,
+
+    /// The index of the input in the bitcoin transaction.
+    pub(super) input_index: DbInputIndex,
+
+    /// The hex-serialized witness.
+    pub(super) witness: DbTaprootWitness,
+}
+
 /// The model for joint query of kickoff txid to FundingInfo.
 #[derive(Debug, Clone, sqlx::FromRow, PartialEq)]
+#[expect(dead_code)]
 pub(super) struct CollectedSigsPerMsg {
     /// The hash of the message stored as `BLOB`.
     pub(super) msg_hash: Vec<u8>,
 
     /// The ID of the operator stored as `INTEGER`.
-    pub(super) operator_id: DbOperatorId,
+    pub(super) operator_idx: DbOperatorIdx,
 
     /// The hex-serialized partial signature.
     pub(super) partial_signature: DbPartialSig,
@@ -226,9 +248,9 @@ pub(super) struct CollectedSigsPerMsg {
 
 /// The model for joint query of kickoff txid to FundingInfo.
 #[derive(Debug, Clone, sqlx::FromRow)]
+#[expect(dead_code)]
 pub(super) struct JoinedKickoffInfo {
     /// The hex-serialized kickoff txid.
-    #[expect(dead_code)]
     pub(super) ki_txid: DbTxid,
 
     /// The serialized change address in the kickoff transaction.
@@ -255,6 +277,7 @@ pub(super) struct JoinedKickoffInfo {
 
 /// The model for outpoints.
 #[derive(Debug, Clone, sqlx::FromRow)]
+#[expect(dead_code)]
 pub(super) struct DbOutPoint {
     /// The hex-serialized txid.
     pub(super) txid: DbTxid,
@@ -265,6 +288,26 @@ pub(super) struct DbOutPoint {
 
 /// The model for checkpoint index.
 #[derive(Debug, Clone, sqlx::FromRow)]
+#[expect(dead_code)]
 pub(super) struct CheckPointIdx {
     pub(super) value: u64,
+}
+
+/// The model to map partial signatures to operators.
+#[derive(Debug, Clone, sqlx::FromRow)]
+#[expect(dead_code)]
+pub(super) struct PartialSignatures {
+    /// The ID of the operator stored as `INTEGER`.
+    pub(super) operator_idx: DbOperatorIdx,
+
+    /// The hex-serialized txid.
+    #[expect(dead_code)]
+    pub(super) txid: DbTxid,
+
+    /// The index of the input in the bitcoin transaction.
+    #[expect(dead_code)]
+    pub(super) input_index: DbInputIndex,
+
+    /// The hex-serialized partial signature.
+    pub(super) partial_signature: DbPartialSig,
 }

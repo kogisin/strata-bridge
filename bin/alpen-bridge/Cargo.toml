@@ -1,21 +1,14 @@
 [package]
 name = "alpen-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "alpen-bridge"
 path = "src/main.rs"
-
-[lints]
-rust.missing_debug_implementations = "warn"
-rust.rust_2018_idioms = { level = "deny", priority = -1 }
-rust.unreachable_pub = "warn"
-rust.unused_crate_dependencies = "deny"
-rust.unused_must_use = "deny"
-# TODO: add these back once the impl is complete
-# rust.missing_docs = "warn"
-# rustdoc.all = "warn"
 
 [dependencies]
 alpen-bridge-params.workspace = true
@@ -23,22 +16,26 @@ btc-notify.workspace = true
 duty-tracker.workspace = true
 operator-wallet.workspace = true
 secret-service-client.workspace = true
+strata-bridge-connectors.workspace = true
 strata-bridge-db.workspace = true
 strata-bridge-p2p-service.workspace = true
 strata-bridge-primitives.workspace = true
 strata-bridge-rpc.workspace = true
 strata-bridge-stake-chain.workspace = true
-strata-btcio.workspace = true
+strata-bridge-tx-graph.workspace = true
 strata-p2p.workspace = true
 strata-p2p-types.workspace = true
 strata-primitives.workspace = true
 
-strata-common.workspace = true
+strata-bridge-common.workspace = true
+strata-tasks.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true
 bdk_bitcoind_rpc.workspace = true
+bincode.workspace = true
 bitcoin.workspace = true
+bitcoind-async-client.workspace = true
 chrono.workspace = true
 clap.workspace = true
 hex.workspace = true
@@ -49,7 +46,21 @@ rustls-pemfile = "2.2.0"
 secp256k1.workspace = true
 secret-service-proto.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+memory_pprof = { path = "../../crates/memory_pprof", optional = true }
+tikv-jemallocator = "0.6"
+
+[features]
+default = []
+# not compatible with windows/msvc
+memory_profiling = [
+  "tikv-jemallocator/profiling",
+  "tikv-jemallocator/unprefixed_malloc_on_supported_platforms",
+  "dep:memory_pprof",
+]

@@ -1,9 +1,11 @@
+//! Prover module.
+
 use anyhow::Context;
 use ark_bn254::{Bn254, Fr};
 use ark_ff::PrimeField;
 use ark_groth16::Proof;
 use sp1_sdk::{HashableKey, SP1VerifyingKey};
-use sp1_verifier::hash_public_inputs;
+use sp1_verifier::{blake3_hash, hash_public_inputs_with_fn};
 use strata_bridge_guest_builder::GUEST_BRIDGE_ELF;
 use strata_bridge_proof_protocol::{
     get_native_host, BridgeProgram, BridgeProofInput, BridgeProofPublicOutput,
@@ -13,8 +15,7 @@ use zkaleido::{ZkVmProgram, ZkVmVerifier};
 use zkaleido_sp1_groth16_verifier::verify_groth16;
 use zkaleido_sp1_host::SP1Host;
 
-use crate::sp1;
-
+/// Proves a bridge proof using SP1.
 pub fn sp1_prove(
     input: &BridgeProofInput,
 ) -> anyhow::Result<(Proof<Bn254>, [Fr; 1], BridgeProofPublicOutput)> {
@@ -39,9 +40,10 @@ pub fn sp1_prove(
 
     // SP1 prepends the raw Groth16 proof with the first 4 bytes of the groth16 vkey
     // The use of correct vkey is checked in verify_groth16 function above
-    let proof = sp1::load_groth16_proof_from_bytes(&proof_receipt.proof().as_bytes()[4..]);
-    let public_inputs = [Fr::from_be_bytes_mod_order(&hash_public_inputs(
+    let proof = sp1_verifier::load_ark_proof_from_bytes(&proof_receipt.proof().as_bytes()[4..])?;
+    let public_inputs = [Fr::from_be_bytes_mod_order(&hash_public_inputs_with_fn(
         proof_receipt.public_values().as_bytes(),
+        blake3_hash,
     ))];
     info!(action = "loaded proof and public params");
 

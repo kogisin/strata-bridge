@@ -1,28 +1,34 @@
 //! Defines the main loop for the bridge-client in operator mode.
 use std::{
+    collections::{BTreeSet, VecDeque},
     env, fs, io,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use bdk_bitcoind_rpc::bitcoincore_rpc;
 use bitcoin::{
     hashes::Hash,
     secp256k1::SecretKey,
     sighash::{Prevouts, SighashCache, TapSighashType},
-    FeeRate, OutPoint, TxOut,
+    FeeRate, OutPoint, ScriptBuf, TxOut, XOnlyPublicKey,
+};
+use bitcoind_async_client::{
+    traits::{Broadcaster, Reader},
+    Client as BitcoinClient,
 };
 use btc_notify::client::BtcZmqClient;
 use duty_tracker::{
     contract_manager::ContractManager, contract_persister::ContractPersister,
-    stake_chain_persister::StakeChainPersister, tx_driver::TxDriver,
+    shutdown::ShutdownHandler, stake_chain_persister::StakeChainPersister, tx_driver::TxDriver,
 };
 use libp2p::{
     identity::{secp256k1::PublicKey as LibP2pSecpPublicKey, PublicKey as LibP2pPublicKey},
     PeerId,
 };
+use musig2::KeyAggContext;
 use operator_wallet::{sync::Backend, OperatorWallet, OperatorWalletConfig};
 use secp256k1::{Parity, SECP256K1};
 use secret_service_client::{
@@ -32,7 +38,7 @@ use secret_service_client::{
     },
     SecretServiceClient,
 };
-use secret_service_proto::v1::traits::{Musig2Signer, P2PSigner, SecretService, WalletSigner};
+use secret_service_proto::v2::traits::{P2PSigner, SchnorrSigner, SecretService};
 use sqlx::{
     migrate::Migrator,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -45,14 +51,11 @@ use strata_bridge_primitives::{
     constants::SEGWIT_MIN_AMOUNT, operator_table::OperatorTable, types::OperatorIdx,
 };
 use strata_bridge_stake_chain::prelude::OPERATOR_FUNDS;
-use strata_btcio::rpc::{
-    traits::{BroadcasterRpc, ReaderRpc},
-    BitcoinClient,
-};
 use strata_p2p::swarm::handle::P2PHandle;
-use strata_p2p_types::P2POperatorPubKey;
-use tokio::{spawn, task::JoinHandle, try_join};
-use tracing::{debug, info};
+use strata_p2p_types::{P2POperatorPubKey, StakeChainId};
+use strata_tasks::TaskExecutor;
+use tokio::{net::lookup_host, select, sync::mpsc, task::JoinHandle};
+use tracing::{debug, error, info};
 
 use crate::{
     config::{Config, P2PConfig, SecretServiceConfig},
@@ -61,25 +64,38 @@ use crate::{
 };
 
 /// Bootstraps the bridge client in Operator mode by hooking up all the required auxiliary services
-/// including database, rpc server, etc.
-pub(crate) async fn bootstrap(params: Params, config: Config) -> anyhow::Result<()> {
-    info!("bootstrapping operator node");
+/// including database, rpc server, graceful shutdown handler, etc.
+pub(crate) async fn bootstrap(
+    params: Params,
+    config: Config,
+    executor: TaskExecutor,
+) -> anyhow::Result<()> {
+    debug!("bootstrapping operator node");
 
     // Secret Service stuff.
-    info!("initializing the secret service client");
+    debug!("initializing secret service client (s2)");
     let s2_client = init_secret_service_client(&config.secret_service_client).await;
-    let sk = s2_client
+    let p2p_sk = s2_client
         .p2p_signer()
         .secret_key()
         .await
-        .map_err(|e| anyhow!("error while asking for p2p key: {e:?}"))?;
-    info!(
-        "Retrieved P2P secret key from S2: {sk_fingerprint:?}",
-        sk_fingerprint = sk
-    );
+        .map_err(|e| anyhow!("error while requesting p2p key: {e:?}"))?;
+    debug!(key = ?p2p_sk, "p2p secret key");
+    let p2p_pk = p2p_sk.public_key(SECP256K1);
+    info!(key=%p2p_pk, "p2p public key");
 
-    let my_btc_key = s2_client.musig2_signer().pubkey().await?;
-    info!(%my_btc_key, "Retrieved MuSig2 operator key from S2");
+    let my_btc_pk = s2_client.musig2_signer().pubkey().await?;
+    info!(key=%my_btc_pk, "musig2 public key");
+
+    let pks = params
+        .keys
+        .musig2
+        .iter()
+        .map(|k| k.public_key(Parity::Even))
+        .collect::<Vec<_>>();
+    let aggregated_xonly_pubkey: XOnlyPublicKey =
+        KeyAggContext::new(pks).unwrap().aggregated_pubkey();
+    info!(key=%aggregated_xonly_pubkey, "aggregated musig2 bridge key");
 
     // Database instances.
     let db = init_database_handle(&config).await;
@@ -96,15 +112,49 @@ pub(crate) async fn bootstrap(params: Params, config: Config) -> anyhow::Result<
     )?;
 
     // Initialize the operator wallet.
-    let mut operator_wallet = init_operator_wallet(&config, &params, s2_client.clone()).await?;
+    let p2p_keys = params.keys.p2p.iter().cloned().map(P2POperatorPubKey::from);
+    let musig_keys = params
+        .keys
+        .musig2
+        .iter()
+        .cloned()
+        .map(|x| x.public_key(Parity::Even));
+    let zipped = p2p_keys.zip(musig_keys);
+    let indexed = zipped.enumerate().map(|(i, (op, btc))| (i as u32, op, btc));
+    let operator_table = OperatorTable::new(
+        indexed.collect(),
+        OperatorTable::select_btc_x_only(my_btc_pk),
+    )
+    .context("could not build OperatorTable")?;
+
+    let leased = StakeChainPersister::new(db.clone())
+        .await?
+        .load(&operator_table)
+        .await?
+        .get(operator_table.pov_p2p_key())
+        .map_or(BTreeSet::new(), |inputs| {
+            inputs
+                .stake_inputs
+                .values()
+                .map(|x| x.operator_funds)
+                .collect()
+        });
+    let mut operator_wallet =
+        init_operator_wallet(&config, &params, s2_client.clone(), leased).await?;
 
     // Get the operator's key index.
     let my_index = params
         .keys
         .musig2
         .iter()
-        .position(|k| k == &my_btc_key)
+        .position(|k| k == &my_btc_pk)
         .expect("should be able to find my index") as u32;
+
+    // Initialize the P2P handle.
+    info!("initializing p2p handle");
+    let (p2p_handle, p2p_task) = init_p2p_handle(&config, &params, p2p_sk).await?;
+    debug!("p2p handle initialized");
+    let p2p_handle_rpc = p2p_handle.clone();
 
     // Handle the stakechain genesis.
     handle_stakechain_genesis(
@@ -116,36 +166,104 @@ pub(crate) async fn bootstrap(params: Params, config: Config) -> anyhow::Result<
     )
     .await;
 
-    // P2P message handler.
-    let (message_handler, p2p_task) = init_p2p_msg_handler(&config, &params, sk).await?;
-    info!(?message_handler, "initialized the P2P message handler");
-    let p2p_handle_rpc = message_handler.handle.clone();
+    let current = bitcoin_rpc_client.get_block_count().await?;
+    let bury_height = current.saturating_sub(config.btc_zmq.bury_depth() as u64);
 
+    // we grab every block starting with the block after the bury_height all the way up to the
+    // current height and place it in the unburied blocks queue.
+    let mut unburied_blocks = VecDeque::new();
+    for height in bury_height + 1..=current {
+        unburied_blocks.push_front(bitcoin_rpc_client.get_block_at(height).await?);
+    }
     // Initialize the duty tracker.
-    info!("initializing the duty tracker with the contract manager");
-    let zmq_client =
-        BtcZmqClient::connect(&config.btc_zmq).expect("should be able to connect to zmq");
-    init_duty_tracker(
+    info!("initializing contract manager");
+    let zmq_client = BtcZmqClient::connect(&config.btc_zmq, unburied_blocks)
+        .await
+        .expect("should be able to connect to zmq");
+
+    let pre_stake_pubkey = operator_wallet.stakechain_script_buf();
+    let (contract_manager, contract_persister, stake_chain_persister) = init_duty_tracker(
         &params,
         &config,
+        operator_table,
+        pre_stake_pubkey.clone(),
         bitcoin_rpc_client.clone(),
         zmq_client,
         s2_client,
-        message_handler,
+        p2p_handle,
         operator_wallet,
         db,
     )
     .await?;
-    info!("initialized the contract manager");
+    debug!("contract manager initialized");
 
-    info!("starting the RPC server");
-    let rpc_address = config.rpc_addr.clone();
-    let rpc_task = start_rpc_server(rpc_address, db_rpc, p2p_handle_rpc, params.clone()).await?;
-    info!("started the RPC server");
+    // Create shutdown handler for graceful shutdown.
+    let shutdown_handler = ShutdownHandler::new(contract_persister, stake_chain_persister);
 
-    // Wait for all tasks to run
-    // They are supposed to run indefinitely in most cases
-    try_join!(rpc_task, p2p_task)?;
+    info!("starting rpc server");
+    let rpc_config = config.rpc.clone();
+    let rpc_params = params.clone();
+    let rpc_addr = rpc_config.rpc_addr.clone();
+    executor.spawn_critical_async_with_shutdown("rpc_server", |_| async move {
+        let rpc_client = BridgeRpc::new(db_rpc, p2p_handle_rpc, rpc_params, rpc_config);
+        start_rpc(&rpc_client, rpc_addr.as_str()).await
+    });
+    debug!("rpc server started");
+
+    info!("starting p2p service");
+    executor.spawn_critical_async_with_shutdown("p2p_service", |_| async move {
+        p2p_task.await.map_err(anyhow::Error::from)
+    });
+    debug!("p2p service started");
+
+    info!("starting contract manager");
+    let shutdown_timeout = config.shutdown_timeout;
+    executor.spawn_critical_async_with_shutdown("contract_manager", |shutdown_guard| async move {
+        let mut contract_manager = contract_manager;
+
+        // Race between shutdown signal and contract manager completion
+        select! {
+            // Handle shutdown signal.
+            _ = shutdown_guard.wait_for_shutdown() => {
+                info!("shutdown signal received, initiating graceful shutdown");
+
+                // Extract execution state and persist before shutdown.
+                match contract_manager.shutdown_and_extract_state().await {
+                    Ok(execution_state) => {
+                        info!("extracted execution state, persisting before shutdown");
+                        match shutdown_handler
+                            .persist_state_before_shutdown(
+                                &execution_state,
+                                &shutdown_guard,
+                                shutdown_timeout,
+                            )
+                            .await
+                        {
+                            Ok(()) => info!("successfully persisted state before shutdown"),
+                            Err(e) => error!("failed to persist state before shutdown: {e:?}"),
+                        }
+                    }
+                    Err(e) => error!("failed to extract execution state: {e:?}"),
+                }
+                Ok(())
+            }
+
+            // Handle contract manager completion (this should indicate an error)
+            result = &mut contract_manager.thread_handle => {
+                match result {
+                    Ok(e) => {
+                        error!("contract manager failed: {e:?}");
+                        Err(anyhow::Error::from(e))
+                    }
+                    Err(e) => {
+                        error!("contract manager panicked: {e:?}");
+                        Err(anyhow::Error::from(e))
+                    }
+                }
+            }
+        }
+    });
+    debug!("contract manager started");
 
     Ok(())
 }
@@ -171,9 +289,14 @@ async fn init_secret_service_client(config: &SecretServiceConfig) -> SecretServi
         .with_client_auth_cert(certs, key)
         .expect("good client config");
 
+    let mut addrs = lookup_host(&config.server_addr)
+        .await
+        .expect("DNS resolution failed");
+
+    let server_addr = addrs.next().expect("DNS resolved, but no addresses");
+
     let s2_config = secret_service_client::Config {
-        // fixme: use dns lookup
-        server_addr: config.server_addr.parse().expect("invalid server address"),
+        server_addr,
         server_hostname: config.server_hostname.clone(),
         local_addr: None,
         tls_config: tls_client_config,
@@ -194,14 +317,14 @@ fn read_cert(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
     }
 }
 
-/// Initialize the P2P message handler.
+/// Initialize the P2P handle.
 ///
 /// Needs a secret key and configuration.
-async fn init_p2p_msg_handler(
+async fn init_p2p_handle(
     config: &Config,
     params: &Params,
     sk: SecretKey,
-) -> anyhow::Result<(MessageHandler, JoinHandle<()>)> {
+) -> anyhow::Result<(P2PHandle, JoinHandle<()>)> {
     let my_key = LibP2pSecpPublicKey::try_from_bytes(&sk.public_key(SECP256K1).serialize())
         .expect("infallible");
     let other_operators: Vec<LibP2pSecpPublicKey> = params
@@ -227,6 +350,9 @@ async fn init_p2p_msg_handler(
         listening_addr,
         connect_to,
         num_threads,
+        dial_timeout,
+        general_timeout,
+        connection_check_interval,
     } = config.p2p.clone();
 
     let config = P2PConfiguration::new_with_secret_key(
@@ -237,9 +363,12 @@ async fn init_p2p_msg_handler(
         connect_to,
         signers_allowlist,
         num_threads,
+        dial_timeout,
+        general_timeout,
+        connection_check_interval,
     );
     let (p2p_handle, _cancel, listen_task) = p2p_bootstrap(&config).await?;
-    Ok((MessageHandler::new(p2p_handle), listen_task))
+    Ok((p2p_handle, listen_task))
 }
 
 async fn init_database_handle(config: &Config) -> SqliteDb {
@@ -263,14 +392,14 @@ async fn init_database_handle(config: &Config) -> SqliteDb {
 
     let current_dir = env::current_dir().expect("should be able to get current working directory");
     let migrations_path = current_dir.join("migrations");
-    info!(?migrations_path, "migrations path");
-    info!(exists = %migrations_path.exists(), "migrations path exists");
+    debug!(?migrations_path, "migrations path");
+    debug!(exists = %migrations_path.exists(), "migrations path exists");
 
     let migrator = Migrator::new(migrations_path)
         .await
         .expect("should be able to initialize migrator");
 
-    info!(action = "running migrations", %DB_NAME);
+    info!(%DB_NAME, "running migrations");
     migrator
         .run(&pool)
         .await
@@ -313,50 +442,44 @@ fn create_db_file(datadir: impl AsRef<Path>, db_name: &str) -> PathBuf {
     db_path
 }
 
-/// Initializes the duty tracker by creating a new [`ContractManager`].
+/// Initializes the duty tracker by creating a new [`ContractManager`] task.
 #[expect(clippy::too_many_arguments)]
 async fn init_duty_tracker(
     params: &Params,
     config: &Config,
+    operator_table: OperatorTable,
+    pre_stake_pubkey: ScriptBuf,
     rpc_client: BitcoinClient,
     zmq_client: BtcZmqClient,
     s2_client: SecretServiceClient,
-    message_handler: MessageHandler,
+    p2p_handle: P2PHandle,
     operator_wallet: OperatorWallet,
     db: SqliteDb,
-) -> anyhow::Result<ContractManager> {
+) -> anyhow::Result<(ContractManager, ContractPersister, StakeChainPersister)> {
     let network = params.network;
     let nag_interval = config.nag_interval;
     let connector_params = params.connectors;
-    let pegout_graph_params = params.tx_graph.clone();
+    let pegout_graph_params = params.tx_graph;
     let stake_chain_params = params.stake_chain;
     let sidesystem_params = params.sidesystem.clone();
-    let operator_table_entries: Vec<(u32, P2POperatorPubKey, secp256k1::PublicKey)> = params
-        .keys
-        .p2p
-        .iter()
-        .zip(params.keys.musig2.iter())
-        .map(|(p2p_key, musig2_x_only_key)| {
-            let p2p_key = P2POperatorPubKey::from(p2p_key.clone());
-            let musig2_key = musig2_x_only_key.public_key(Parity::Even);
-            (p2p_key, musig2_key)
-        })
-        .enumerate()
-        .map(|(idx, (p2p, musig2))| (idx as u32, p2p, musig2))
-        .collect();
-    let my_btc_key = s2_client.musig2_signer().pubkey().await?;
-    let my_idx = operator_table_entries
-        .iter()
-        .position(|(_, _, key)| key.x_only_public_key().0 == my_btc_key)
-        .expect("should be able to find my index");
-    let operator_table =
-        OperatorTable::new(operator_table_entries, my_idx as u32).expect("my index exists");
     let tx_driver = TxDriver::new(zmq_client.clone(), rpc_client.clone()).await;
-    let p2p_handle = message_handler.handle.clone();
-    let contract_persister = ContractPersister::new(db.pool().clone()).await?;
-    let stake_chain_persister = StakeChainPersister::new(db.clone()).await?;
 
-    Ok(ContractManager::new(
+    let db_pool = db.pool().clone();
+    info!("initializing contract persister");
+    let contract_persister = ContractPersister::new(db_pool.clone(), config.db).await?;
+    debug!("contract persister initialized");
+
+    info!("initializing stake chain persister");
+    let stake_chain_persister = StakeChainPersister::new(db.clone()).await?;
+    debug!("stake chain persister initialized");
+
+    // Create separate persisters for shutdown handler since they don't implement Clone
+    info!("initializing shutdown persisters");
+    let shutdown_contract_persister = ContractPersister::new(db_pool.clone(), config.db).await?;
+    let shutdown_stake_chain_persister = StakeChainPersister::new(db.clone()).await?;
+    debug!("shutdown persisters initialized");
+
+    let contract_manager = ContractManager::new(
         network,
         nag_interval,
         connector_params,
@@ -364,6 +487,11 @@ async fn init_duty_tracker(
         stake_chain_params,
         sidesystem_params,
         operator_table,
+        config.is_faulty,
+        config.min_withdrawal_fulfillment_window,
+        config.stake_funding_pool_size,
+        config.stake_tx,
+        pre_stake_pubkey,
         zmq_client,
         rpc_client,
         tx_driver,
@@ -373,22 +501,13 @@ async fn init_duty_tracker(
         s2_client,
         operator_wallet,
         db,
-    ))
-}
+    );
 
-async fn start_rpc_server(
-    rpc_address: String,
-    db: SqliteDb,
-    p2p_handle: P2PHandle,
-    params: Params,
-) -> anyhow::Result<JoinHandle<()>> {
-    let rpc_client = BridgeRpc::new(db, p2p_handle, params);
-    let handle = spawn(async move {
-        start_rpc(&rpc_client, rpc_address.as_str())
-            .await
-            .expect("failed to start RPC server");
-    });
-    Ok(handle)
+    Ok((
+        contract_manager,
+        shutdown_contract_persister,
+        shutdown_stake_chain_persister,
+    ))
 }
 
 /// Initializes the operator wallet
@@ -396,7 +515,10 @@ async fn init_operator_wallet(
     config: &Config,
     params: &Params,
     s2_client: SecretServiceClient,
+    leased_outpoints: BTreeSet<OutPoint>,
 ) -> anyhow::Result<OperatorWallet> {
+    info!("initializing operator wallet");
+
     // BitcoinD RPC client for the Operator Wallet.
     let auth = bitcoincore_rpc::Auth::UserPass(
         config.btc_client.user.to_string(),
@@ -406,7 +528,7 @@ async fn init_operator_wallet(
         bitcoincore_rpc::Client::new(config.btc_client.url.as_str(), auth)
             .expect("should be able to create bitcoin client"),
     );
-    info!(?bitcoin_rpc_client, "bitcoin rpc client");
+    debug!(?bitcoin_rpc_client, "bitcoin rpc client");
 
     // Operator wallet stuff.
     let general_key = s2_client.general_wallet_signer().pubkey().await?;
@@ -415,21 +537,22 @@ async fn init_operator_wallet(
     info!(%stakechain_key, "operator wallet stakechain key");
     let operator_wallet_config = OperatorWalletConfig::new(
         OPERATOR_FUNDS,
-        config.operator_wallet.stake_funding_pool_size,
         SEGWIT_MIN_AMOUNT,
         params.stake_chain.stake_amount,
         params.network,
     );
+    debug!(?operator_wallet_config, "operator wallet config");
 
     let sync_backend = Backend::BitcoinCore(bitcoin_rpc_client.clone());
-    info!(?sync_backend, "operator wallet sync backend");
+    debug!(?sync_backend, "operator wallet sync backend");
     let operator_wallet = OperatorWallet::new(
         general_key,
         stakechain_key,
         operator_wallet_config,
         sync_backend,
+        leased_outpoints,
     );
-    info!(?operator_wallet, "created operator wallet");
+    debug!("operator wallet initialized");
 
     Ok(operator_wallet)
 }
@@ -445,15 +568,33 @@ async fn handle_stakechain_genesis(
     my_index: OperatorIdx,
     bitcoin_rpc_client: Arc<BitcoinClient>,
 ) {
-    if db
+    // the ouroboros sender is part of the message handler interface but is unused when sending
+    // stakechain genesis information.
+    let (ouroboros_msg_sender, _ouroboros_msg_receiver) = mpsc::unbounded_channel();
+    let (ouroboros_req_sender, _ouroboros_req_receiver) = mpsc::unbounded_channel();
+    let message_handler = MessageHandler::new(ouroboros_msg_sender, ouroboros_req_sender);
+    let general_key = s2_client
+        .general_wallet_signer()
+        .pubkey()
+        .await
+        .expect("must be able to get the pubkey from general wallet");
+
+    if let Some(pre_stake) = db
         .get_pre_stake(my_index)
         .await
         .expect("should be able to consult the database")
-        .is_none()
     {
+        let stake_chain_id = StakeChainId::from_bytes([0u8; 32]);
+        info!(%stake_chain_id, "broadcasting pre-stake information");
+
+        message_handler
+            .send_stake_chain_exchange(stake_chain_id, general_key, pre_stake.txid, pre_stake.vout)
+            .await;
+    } else {
         // This means that we don't have a pre-stake tx in the database.
         // We need to create a pre-stake tx, sign it, broadcast it and save it to the database.
-        info!("no pre-stake tx in the database, creating one");
+        info!("pre-stake tx not found, creating...");
+
         let fee_rate = bitcoin_rpc_client
             .estimate_smart_fee(1)
             .await
@@ -462,15 +603,15 @@ async fn handle_stakechain_genesis(
         let fee_rate =
             FeeRate::from_sat_per_vb(fee_rate).expect("should be able to create a fee rate");
 
-        info!(%fee_rate, "fetched fee rate from bitcoin client");
+        debug!(%fee_rate, "fetched fee rate from bitcoin client");
 
         // We need to sync the wallet.
-        info!("syncing the operator wallet");
+        info!("syncing operator wallet");
         operator_wallet
             .sync()
             .await
             .expect("should be able to sync the wallet");
-        info!("synced the operator wallet");
+        debug!("operator wallet synced");
 
         // Create the PreStake tx.
         let pre_stake_psbt = operator_wallet
@@ -479,7 +620,7 @@ async fn handle_stakechain_genesis(
         // Get the unsigned pre-stake tx.
         let pre_stake_tx = pre_stake_psbt.unsigned_tx;
         let pre_stake_txid = pre_stake_tx.compute_txid();
-        info!(%pre_stake_txid, "created the pre-stake tx");
+        debug!(%pre_stake_txid, "pre-stake tx created");
 
         // Collect all the UTXOs in the stakechain wallet that match the pre-stake tx inputs.
         let general_wallet = operator_wallet.general_wallet();
@@ -488,7 +629,6 @@ async fn handle_stakechain_genesis(
             .iter()
             .map(|i| {
                 let outpoint = i.previous_output;
-                info!(?outpoint, "outpoint");
                 general_wallet
                     .get_utxo(outpoint)
                     .expect("should be able to get the outpoint")
@@ -516,16 +656,18 @@ async fn handle_stakechain_genesis(
                 .push(signature.serialize());
         }
         let signed_pre_stake_tx = sighasher.into_transaction();
-        info!(%pre_stake_txid, "signed the pre-stake tx");
+        debug!(%pre_stake_txid, "pre-stake tx signed");
 
         // Broadcast the pre-stake tx.
+        info!(%pre_stake_txid, "broadcasting pre-stake tx");
         bitcoin_rpc_client
             .send_raw_transaction(&signed_pre_stake_tx)
             .await
             .expect("should be able to broadcast the pre-stake tx");
-        info!(%pre_stake_txid, "broadcasted the pre-stake tx");
+        debug!(%pre_stake_txid, "pre-stake tx broadcasted");
 
         // Save the pre-stake tx to the database.
+        info!(%pre_stake_txid, "committing pre-stake tx");
         let pre_stake_outpoint = OutPoint {
             txid: pre_stake_txid,
             vout: 0, // NOTE: the protocol specifies that the s_connector vout is 0
@@ -533,6 +675,13 @@ async fn handle_stakechain_genesis(
         db.set_pre_stake(my_index, pre_stake_outpoint)
             .await
             .expect("should be able to save the pre-stake tx to the database");
-        info!(%pre_stake_txid, "saved the pre-stake tx to the database");
+        debug!(%pre_stake_txid, "pre-stake tx committed");
+
+        let stake_chain_id = StakeChainId::from_bytes([0u8; 32]);
+        info!(%stake_chain_id, "broadcasting pre-stake information");
+        message_handler
+            .send_stake_chain_exchange(stake_chain_id, general_key, pre_stake_txid, 0)
+            .await;
+        debug!(%stake_chain_id, "pre-stake information broadcasted");
     }
 }

@@ -1,3 +1,5 @@
+//! Constructs the CPFP transaction.
+
 use std::{collections::BTreeMap, marker::PhantomData};
 
 use bitcoin::{
@@ -90,12 +92,16 @@ pub struct Cpfp<Status = Unfunded> {
 }
 
 impl Cpfp {
+    /// The index of the parent input in the child transaction.
     pub const PARENT_INPUT_INDEX: usize = 0;
+
+    /// The index of the funding input in the child transaction.
     pub const FUNDING_INPUT_INDEX: usize = 1;
 }
 
 impl<Status> Cpfp<Status> {
-    pub fn psbt(&self) -> &Psbt {
+    /// Returns the underlying PSBT of the child transaction.
+    pub const fn psbt(&self) -> &Psbt {
         &self.psbt
     }
 
@@ -193,7 +199,8 @@ impl Cpfp<Unfunded> {
         }
     }
 
-    pub fn psbt_mut(&mut self) -> &mut Psbt {
+    /// A mutable reference to the underlying PSBT.
+    pub const fn psbt_mut(&mut self) -> &mut Psbt {
         &mut self.psbt
     }
 
@@ -282,10 +289,10 @@ mod tests {
     use std::{collections::HashSet, str::FromStr};
 
     use bitcoin::{consensus, Network};
+    use bitcoind_async_client::types::{ListUnspent, SignRawTransactionWithWallet};
     use corepc_node::{serde_json::json, Conf, Node};
+    use strata_bridge_common::logging::{self, LoggerConfig};
     use strata_bridge_test_utils::prelude::{find_funding_utxo, generate_keypair, sign_cpfp_child};
-    use strata_btcio::rpc::types::{ListUnspent, SignRawTransactionWithWallet};
-    use strata_common::logging::{self, LoggerConfig};
 
     use super::*;
 
@@ -295,8 +302,7 @@ mod tests {
 
         let mut conf = Conf::default();
         conf.args.push("-txindex=1");
-        let bitcoind =
-            Node::from_downloaded_with_conf(&conf).expect("must be able to start bitcoind");
+        let bitcoind = Node::with_conf("bitcoind", &conf).expect("must be able to start bitcoind");
         let btc_client = &bitcoind.client;
 
         let network = btc_client

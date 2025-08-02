@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use arbitrary::Arbitrary;
 use bitcoin::{
+    consensus,
     hashes::Hash,
     key::UntweakedPublicKey,
     psbt::Input,
@@ -17,11 +18,9 @@ use bitcoin::{
 use bitvm::treepp::*;
 use secp256k1::{rand::rngs::OsRng, Keypair, Message, Parity, SecretKey};
 use serde::{Deserialize, Serialize};
+use strata_primitives::constants::UNSPENDABLE_PUBLIC_KEY;
 
-use crate::{
-    constants::UNSPENDABLE_INTERNAL_KEY,
-    errors::{BridgeTxBuilderError, BridgeTxBuilderResult},
-};
+use crate::errors::{BridgeTxBuilderError, BridgeTxBuilderResult};
 
 /// Different spending paths for a taproot.
 ///
@@ -34,7 +33,7 @@ pub enum SpendPath<'path> {
         internal_key: UntweakedPublicKey,
     },
     /// Script path spend that only allows spending via scripts in the taproot tree, with the
-    /// internal key being the [`static@UNSPENDABLE_INTERNAL_KEY`].
+    /// internal key being the [`static@UNSPENDABLE_PUBLIC_KEY`].
     ScriptSpend {
         /// The scripts that live in the leaves of the taproot tree.
         scripts: &'path [ScriptBuf],
@@ -65,7 +64,7 @@ pub fn create_taproot_addr<'creator>(
                 return Err(BridgeTxBuilderError::EmptyTapscript);
             }
 
-            build_taptree(*UNSPENDABLE_INTERNAL_KEY, *network, scripts)
+            build_taptree(*UNSPENDABLE_PUBLIC_KEY, *network, scripts)
         }
         SpendPath::Both {
             internal_key,
@@ -152,6 +151,7 @@ fn build_taptree(
     ))
 }
 
+/// Returns the witness stack for a taproot script.
 pub fn taproot_witness_signatures(script: Script) -> Vec<Vec<u8>> {
     let result = execute_script(script);
 
@@ -194,7 +194,7 @@ where
 /// If a script-path path is being used, the witness stack needs the script being spent and the
 /// control block in addition to the signature.
 /// See [BIP 341](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki#constructing-and-spending-taproot-outputs).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaprootWitness {
     /// Use the keypath spend.
     ///
@@ -206,12 +206,65 @@ pub enum TaprootWitness {
     /// This requires the script being spent from as well as the [`ControlBlock`] in addition to
     /// the elements that fulfill the spending condition in the script.
     Script {
+        /// The script being spent.
         script_buf: ScriptBuf,
+
+        /// The control block for the script.
         control_block: ControlBlock,
     },
 
     /// Use the keypath spend tweaked with some known hash.
-    Tweaked { tweak: TapNodeHash },
+    Tweaked {
+        /// The tweak for the keypath spend.
+        tweak: TapNodeHash,
+    },
+}
+
+impl TaprootWitness {
+    /// Serialize the witness to a hex string.
+    pub fn to_hex(&self) -> String {
+        match self {
+            TaprootWitness::Key => "key".to_string(),
+            TaprootWitness::Script {
+                script_buf,
+                control_block,
+            } => format!(
+                "script:{}:{}",
+                consensus::encode::serialize_hex(script_buf),
+                consensus::encode::serialize_hex(&control_block.serialize()),
+            ),
+            TaprootWitness::Tweaked { tweak } => {
+                format!("tweaked:{}", tweak.as_raw_hash())
+            }
+        }
+    }
+
+    /// Deserialize the witness from a hex string.
+    pub fn from_hex(hex: &str) -> Result<Self, anyhow::Error> {
+        let parts = hex.split(':').collect::<Vec<&str>>();
+        if parts.len() != 3 {
+            return Err(anyhow::anyhow!("invalid witness hex"));
+        }
+
+        let witness_type = parts[0];
+        match witness_type {
+            "key" => Ok(Self::Key),
+            "script" => {
+                let script_buf = consensus::encode::deserialize_hex(parts[1])?;
+                let control_block = ControlBlock::decode(parts[2].as_bytes())?;
+
+                Ok(Self::Script {
+                    script_buf,
+                    control_block,
+                })
+            }
+            "tweaked" => {
+                let tweak = TapNodeHash::from_slice(parts[1].as_bytes())?;
+                Ok(Self::Tweaked { tweak })
+            }
+            _ => Err(anyhow::anyhow!("invalid witness hex")),
+        }
+    }
 }
 
 impl<'a> Arbitrary<'a> for TaprootWitness {

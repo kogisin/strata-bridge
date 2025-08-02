@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use musig2::{Musig2Client, Musig2FirstRound, Musig2SecondRound};
+use musig2::Musig2Client;
 use p2p::P2PClient;
 pub use quinn::rustls;
 use quinn::{
@@ -25,7 +25,7 @@ use quinn::{
 };
 use rkyv::{deserialize, rancor, util::AlignedVec};
 use secret_service_proto::{
-    v1::{
+    v2::{
         traits::{Client, ClientError, SecretService},
         wire::{ClientMessage, ServerMessage},
     },
@@ -116,7 +116,7 @@ impl SecretServiceClient {
     }
 }
 
-impl SecretService<Client, Musig2FirstRound, Musig2SecondRound> for SecretServiceClient {
+impl SecretService<Client> for SecretServiceClient {
     type GeneralWalletSigner = GeneralWalletClient;
     type StakechainWalletSigner = StakechainWalletClient;
 
@@ -153,46 +153,62 @@ impl SecretService<Client, Musig2FirstRound, Musig2SecondRound> for SecretServic
     }
 }
 
-/// Makes a v1 secret service request via QUIC.
-pub async fn make_v1_req(
+/// Makes a v2 secret service request via QUIC.
+pub async fn make_v2_req(
     conn: &Connection,
     msg: ClientMessage,
     timeout_dur: Duration,
 ) -> Result<ServerMessage, ClientError> {
-    let (mut tx, mut rx) = conn.open_bi().await.map_err(ClientError::ConnectionError)?;
-    let (len_bytes, msg_bytes) = VersionedClientMessage::V1(msg)
-        .serialize()
-        .map_err(ClientError::SerializationError)?;
-    timeout(timeout_dur, tx.write_all(&len_bytes))
-        .await
-        .map_err(|_| ClientError::Timeout)?
-        .map_err(ClientError::WriteError)?;
-    timeout(timeout_dur, tx.write_all(&msg_bytes))
-        .await
-        .map_err(|_| ClientError::Timeout)?
-        .map_err(ClientError::WriteError)?;
+    async fn v2_req(
+        conn: &Connection,
+        msg: ClientMessage,
+        timeout_dur: Duration,
+        retries: usize,
+    ) -> Result<ServerMessage, ClientError> {
+        let (mut tx, mut rx) = conn.open_bi().await.map_err(ClientError::ConnectionError)?;
+        let (len_bytes, msg_bytes) = VersionedClientMessage::V2(msg.clone())
+            .serialize()
+            .map_err(ClientError::SerializationError)?;
+        timeout(timeout_dur, tx.write_all(&len_bytes))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(ClientError::WriteError)?;
+        timeout(timeout_dur, tx.write_all(&msg_bytes))
+            .await
+            .map_err(|_| ClientError::Timeout)?
+            .map_err(ClientError::WriteError)?;
 
-    let len_to_read = {
-        let mut buf = [0; size_of::<LengthUint>()];
+        let len_to_read = {
+            let mut buf = [0; size_of::<LengthUint>()];
+            timeout(timeout_dur, rx.read_exact(&mut buf))
+                .await
+                .map_err(|_| ClientError::Timeout)?
+                .map_err(ClientError::ReadError)?;
+            LengthUint::from_le_bytes(buf)
+        };
+
+        let mut buf: AlignedVec<16> = AlignedVec::with_capacity(len_to_read as usize);
+        buf.resize(len_to_read as usize, 0);
         timeout(timeout_dur, rx.read_exact(&mut buf))
             .await
             .map_err(|_| ClientError::Timeout)?
             .map_err(ClientError::ReadError)?;
-        LengthUint::from_le_bytes(buf)
-    };
 
-    let mut buf: AlignedVec<16> = AlignedVec::with_capacity(len_to_read as usize);
-    buf.resize(len_to_read as usize, 0);
-    timeout(timeout_dur, rx.read_exact(&mut buf))
-        .await
-        .map_err(|_| ClientError::Timeout)?
-        .map_err(ClientError::ReadError)?;
+        let archived = rkyv::access::<ArchivedVersionedServerMessage, rancor::Error>(&buf)
+            .map_err(ClientError::DeserializationError)?;
 
-    let archived = rkyv::access::<ArchivedVersionedServerMessage, rancor::Error>(&buf)
-        .map_err(ClientError::DeserializationError)?;
+        let VersionedServerMessage::V2(srv_msg) =
+            deserialize(archived).map_err(ClientError::DeserializationError)?;
 
-    let VersionedServerMessage::V1(msg) =
-        deserialize(archived).map_err(ClientError::DeserializationError)?;
+        if let ServerMessage::TryAgain = srv_msg {
+            if retries == 0 {
+                return Err(ClientError::NoMoreRetries);
+            } else {
+                return Box::pin(v2_req(conn, msg, timeout_dur, retries - 1)).await;
+            }
+        }
 
-    Ok(msg)
+        Ok(srv_msg)
+    }
+    return v2_req(conn, msg, timeout_dur, 10).await;
 }

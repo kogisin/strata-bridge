@@ -13,10 +13,22 @@ use crate::{
 };
 
 /// The number of headers after withdrawal fulfillment transaction that must be provided as private
-/// input
+/// input.
 ///
-/// TODO: update this once this is fixed
-pub const REQUIRED_NUM_OF_HEADERS_AFTER_WITHDRAWAL_FULFILLMENT_TX: usize = 30;
+/// This is essentially the number of headers in the chain fragment used in the proof.
+/// The longer it is the harder it is to mine privately.
+// TODO: (@prajwolrg, @Rajil1213) update this once this is finalized.
+// It's fine to have a smaller value in testnet-I since we run the bridge nodes and they're
+// incapable of constructing a private fork but this needs to be higher for mainnet (at least in the
+// BitVM-based bridge design).
+// The reason for choosing a lower value is that we want the bridge node
+// to be able to generate the proof immediately when it needs to i.e., after it is challenged and
+// the timelock between the `Claim` and `PreAssert` transaction has expired, without having to wait
+// for a long time for the bitcoin chain to have enough headers after the withdrawal fulfillment
+// transaction. This means that this needs to be set to a value that is lower than the
+// `pre_assert_timelock` in the bridge params. To facilitate local testing, this has been sent to a
+// much smaller value of `10`.
+pub const REQUIRED_NUM_OF_HEADERS_AFTER_WITHDRAWAL_FULFILLMENT_TX: usize = 10;
 
 /// Verifies that the given transaction is included in the provided Bitcoin header's merkle root.
 /// Also optionally checks if the transaction includes witness data.
@@ -89,20 +101,25 @@ pub(crate) fn process_bridge_proof(
     )?;
 
     // 3a. Extract withdrawal fulfillment info.
-    let (withdrawal_fulfillment_tx, withdrawal_fullfillment_idx) = &input.withdrawal_fulfillment_tx;
+    let (withdrawal_fulfillment_tx, withdrawal_fulfillment_idx) = &input.withdrawal_fulfillment_tx;
     let WithdrawalInfo {
         operator_idx,
+        deposit_idx,
+        deposit_txid,
         withdrawal_address: destination,
         withdrawal_amount: amount,
         ..
-    } = extract_withdrawal_info(withdrawal_fulfillment_tx.transaction())?;
+    } = extract_withdrawal_info(
+        withdrawal_fulfillment_tx.transaction(),
+        peg_out_graph_params.tag,
+    )?;
 
     // 3b. Verify the inclusion of the withdrawal fulfillment transaction in the header chain. The
     // transaction does not depend on witness data, hence `expect_witness` is `false`.
     verify_tx_inclusion(
         withdrawal_fulfillment_tx,
-        BridgeRelatedTx::WithdrawalFulfillment,
-        headers[*withdrawal_fullfillment_idx],
+        BridgeRelatedTx::WithdrawalFulfillment("".to_string()),
+        headers[*withdrawal_fulfillment_idx],
         false,
     )?;
 
@@ -110,8 +127,16 @@ pub(crate) fn process_bridge_proof(
     // deposit index.
     let entry = chainstate
         .deposits_table()
-        .get_deposit(input.deposit_idx)
-        .ok_or(ChainStateError::DepositNotFound(input.deposit_idx))?;
+        .get_deposit(deposit_idx)
+        .ok_or(ChainStateError::DepositNotFound(deposit_idx))?;
+
+    let deposit_txid_in_chainstate = entry.output().outpoint().txid;
+    if deposit_txid_in_chainstate != deposit_txid {
+        Err(ChainStateError::MismatchedDepositTxid {
+            deposit_txid_in_chainstate,
+            deposit_txid_in_fulfillment: deposit_txid,
+        })?;
+    }
 
     let dispatched_state = match entry.deposit_state() {
         DepositState::Dispatched(dispatched_state) => dispatched_state,
@@ -130,7 +155,7 @@ pub(crate) fn process_bridge_proof(
 
     // 3e. Ensure that the withdrawal was fulfilled before the deadline
     let withdrawal_fulfillment_height =
-        header_vs.last_verified_block.height() as usize + withdrawal_fullfillment_idx;
+        header_vs.last_verified_block.height() as usize + withdrawal_fulfillment_idx;
     if withdrawal_fulfillment_height > dispatched_state.exec_deadline() as usize {
         return Err(BridgeProofError::DeadlineExceeded);
     }
@@ -155,10 +180,10 @@ pub(crate) fn process_bridge_proof(
     }
 
     // 6. Ensure that the transactions are in order
-    if strata_checkpoint_idx > withdrawal_fullfillment_idx {
+    if strata_checkpoint_idx > withdrawal_fulfillment_idx {
         return Err(BridgeProofError::InvalidTxOrder(
             BridgeRelatedTx::StrataCheckpoint,
-            BridgeRelatedTx::WithdrawalFulfillment,
+            BridgeRelatedTx::WithdrawalFulfillment("".to_string()),
         ));
     }
 
@@ -170,7 +195,7 @@ pub(crate) fn process_bridge_proof(
     }
 
     // 8. Verify sufficient headers after claim transaction
-    let headers_after_withdrawal_fulfillment_tx = headers.len() - *withdrawal_fullfillment_idx;
+    let headers_after_withdrawal_fulfillment_tx = headers.len() - *withdrawal_fulfillment_idx;
     if headers_after_withdrawal_fulfillment_tx
         < REQUIRED_NUM_OF_HEADERS_AFTER_WITHDRAWAL_FULFILLMENT_TX
     {
@@ -184,7 +209,7 @@ pub(crate) fn process_bridge_proof(
 
     // 8. Construct the proof output.
     let output = BridgeProofPublicOutput {
-        deposit_txid: entry.output().outpoint().txid.into(),
+        deposit_txid: deposit_txid.into(),
         withdrawal_fulfillment_txid,
     };
 

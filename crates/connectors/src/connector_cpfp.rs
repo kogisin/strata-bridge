@@ -21,7 +21,7 @@ pub struct ConnectorCpfp {
 
 impl ConnectorCpfp {
     /// Constructs a new CPFP connector.
-    pub fn new(public_key: XOnlyPublicKey, network: Network) -> Self {
+    pub const fn new(public_key: XOnlyPublicKey, network: Network) -> Self {
         Self {
             network,
             public_key,
@@ -29,12 +29,12 @@ impl ConnectorCpfp {
     }
 
     /// Returns the public key used to create the child transaction in CPFP.
-    pub fn public_key(&self) -> XOnlyPublicKey {
+    pub const fn public_key(&self) -> XOnlyPublicKey {
         self.public_key
     }
 
     /// Returns the bitcoin network for which to generate output addresses.
-    pub fn network(&self) -> Network {
+    pub const fn network(&self) -> Network {
         self.network
     }
 
@@ -70,12 +70,12 @@ mod tests {
         transaction::Version,
         Address, Amount, OutPoint, Psbt, TapSighashType, Transaction, TxOut,
     };
+    use bitcoind_async_client::types::{ListUnspent, SignRawTransactionWithWallet};
     use corepc_node::{serde_json::json, Conf, Node};
     use secp256k1::{Message, SECP256K1};
+    use strata_bridge_common::logging::{self, LoggerConfig};
     use strata_bridge_primitives::scripts::prelude::{create_tx, create_tx_ins, create_tx_outs};
     use strata_bridge_test_utils::{prelude::generate_keypair, tx::FEES};
-    use strata_btcio::rpc::types::{ListUnspent, SignRawTransactionWithWallet};
-    use strata_common::logging::{self, LoggerConfig};
 
     use super::*;
 
@@ -86,8 +86,7 @@ mod tests {
         let mut conf = Conf::default();
         conf.args.push("-txindex=1");
 
-        let bitcoind =
-            Node::from_downloaded_with_conf(&conf).expect("must be able to start bitcoind");
+        let bitcoind = Node::with_conf("bitcoind", &conf).expect("must be able to start bitcoind");
         let btc_client = &bitcoind.client;
 
         let wallet_addr = btc_client

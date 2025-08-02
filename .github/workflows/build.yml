@@ -13,27 +13,52 @@ env:
 permissions: {}
 
 jobs:
-  crate-checks:
-    name: Check that crates compile on their own
+  extract-rust-version:
+    name: Extract toolchain version
     runs-on: ubuntu-latest
-    timeout-minutes: 90 # cold run takes a lot of time as each crate is compiled separately
+    outputs:
+      nightly-version: ${{ steps.extract-version.outputs.nightly-version }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - name: Extract Rust version
+        id: extract-version
+        uses: ./.github/actions/extract-rust-version
+
+  crate-checks:
+    name: Check that crates compile on their own
+    runs-on: ubuntu-latest
+    needs: extract-rust-version
+    timeout-minutes: 90 # cold run takes a lot of time as each crate is compiled separately
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          toolchain: nightly-2024-11-01
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@b95584d8105b9ab200e15821fa671848cf2b7017 # nightly
+        with:
+          toolchain: ${{ needs.extract-rust-version.outputs.nightly-version }}
+
+      - name: Install latest just release
+        uses: taiki-e/install-action@e8c1cf74a696e981aec979a6703471e61b400895 # v2.57.4
+        with:
+          tool: just
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@69810fea1670baa5ae2a69d28101209dc19bc23d # cargo-hack
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: taiki-e/install-action@cargo-hack
-
-      - uses: Swatinem/rust-cache@v2
+      - name: Rust cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2
         with:
           cache-on-failure: true
 
@@ -43,9 +68,9 @@ jobs:
           echo  "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
 
       - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.6
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
         with:
-          version: "v0.8.1" # sccache version
+          version: "v0.10.0" # sccache version
 
       - name: Install sqlx-cli
         run: cargo install sqlx-cli --locked
@@ -57,9 +82,10 @@ jobs:
           cargo prove --version
 
       - name: Run db migrations
-        run: make migrate
+        run: just migrate
 
-      - run: cargo hack check
+      - name: Check crates compile
+        run: cargo hack check
         env:
           DATABASE_URL: sqlite://./operator.db
           SKIP_GUEST_BUILD: 1

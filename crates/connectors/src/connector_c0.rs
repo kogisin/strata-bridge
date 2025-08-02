@@ -2,6 +2,7 @@
 //!
 //! This connector is spent by either the Pre-Assert transaction if challenged or the
 //! PayoutOptimistic transaction if unchallenged.
+
 use bitcoin::{
     psbt::Input,
     taproot::{ControlBlock, LeafVersion, TaprootSpendInfo},
@@ -29,7 +30,7 @@ where
     W: Sized,
 {
     /// Returns the input index of the transaction for the given spend path.
-    pub fn get_input_index(&self) -> u32 {
+    pub const fn get_input_index(&self) -> u32 {
         match self {
             ConnectorC0Path::PayoutOptimistic(_) => 1,
             ConnectorC0Path::Assert(_) => 0,
@@ -37,7 +38,7 @@ where
     }
 
     /// Returns the sighash type for the given spend path.
-    pub fn get_sighash_type(&self) -> TapSighashType {
+    pub const fn get_sighash_type(&self) -> TapSighashType {
         match self {
             ConnectorC0Path::PayoutOptimistic(_) => TapSighashType::Default,
             ConnectorC0Path::Assert(_) => TapSighashType::Default,
@@ -53,7 +54,7 @@ where
     }
 
     /// Returns the witness data for the path.
-    pub fn get_witness_data(&self) -> &W {
+    pub const fn get_witness_data(&self) -> &W {
         match self {
             ConnectorC0Path::PayoutOptimistic(witness_data) => witness_data,
             ConnectorC0Path::Assert(witness_data) => witness_data,
@@ -71,7 +72,7 @@ pub struct ConnectorC0 {
 
 impl ConnectorC0 {
     /// Constructs a new instance of this connector.
-    pub fn new(
+    pub const fn new(
         n_of_n_agg_pubkey: XOnlyPublicKey,
         network: Network,
         pre_assert_timelock: u32,
@@ -84,7 +85,7 @@ impl ConnectorC0 {
     }
 
     /// Returns the relative timelock on the pre-assert output (measured in number of blocks).
-    pub fn pre_assert_timelock(&self) -> u32 {
+    pub const fn pre_assert_timelock(&self) -> u32 {
         self.pre_assert_timelock
     }
 
@@ -159,7 +160,7 @@ impl ConnectorC0 {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{slice, str::FromStr};
 
     use bitcoin::{
         key::TapTweak,
@@ -168,8 +169,8 @@ mod tests {
     };
     use corepc_node::{Conf, Node};
     use secp256k1::SECP256K1;
+    use strata_bridge_common::logging::{self, LoggerConfig};
     use strata_bridge_test_utils::{prelude::generate_keypair, tx::get_connector_txs};
-    use strata_common::logging::{self, LoggerConfig};
     use tracing::debug;
 
     use super::*;
@@ -180,7 +181,7 @@ mod tests {
 
         let mut conf = Conf::default();
         conf.args.push("-txindex=1");
-        let bitcoind = Node::from_downloaded_with_conf(&conf).unwrap();
+        let bitcoind = Node::with_conf("bitcoind", &conf).unwrap();
         let btc_client = &bitcoind.client;
 
         let network = btc_client
@@ -224,7 +225,7 @@ mod tests {
                         let tweak = connector.generate_merkle_root();
                         (
                             TaprootWitness::Tweaked { tweak },
-                            keypair.tap_tweak(SECP256K1, Some(tweak)).to_inner(),
+                            keypair.tap_tweak(SECP256K1, Some(tweak)).to_keypair(),
                         )
                     }
                     ConnectorC0Path::Assert(_) => {
@@ -252,7 +253,7 @@ mod tests {
 
                 let tx_hash = create_message_hash(
                     &mut SighashCache::new(&spend_connector_tx),
-                    Prevouts::All(&[prevout.clone()]),
+                    Prevouts::All(slice::from_ref(&prevout)),
                     &witness,
                     bitcoin::TapSighashType::Default,
                     0,

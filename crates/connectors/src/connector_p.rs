@@ -1,6 +1,8 @@
 //! This module contains the connector for the second output of the Stake transaction.
 //!
 //! This connector is used to either settle the payout transactions or to burn them.
+use std::slice;
+
 use bitcoin::{
     hashes::{sha256, Hash},
     opcodes::all::{OP_EQUAL, OP_EQUALVERIFY, OP_SHA256, OP_SIZE},
@@ -59,7 +61,7 @@ pub struct ConnectorP {
 impl ConnectorP {
     /// Creates a new [`ConnectorP`] with the given N-of-N aggregated public key, `k`th stake
     /// preimage, and the bitcoin network.
-    pub fn new(
+    pub const fn new(
         n_of_n_agg_pubkey: XOnlyPublicKey,
         stake_hash: sha256::Hash,
         network: Network,
@@ -125,7 +127,7 @@ impl ConnectorP {
             &self.network,
             SpendPath::Both {
                 internal_key: self.n_of_n_agg_pubkey,
-                scripts: &[script.clone()],
+                scripts: slice::from_ref(&script),
             },
         )
         .expect("should be able to create taproot address");
@@ -194,10 +196,10 @@ mod tests {
         absolute, consensus, transaction, Amount, BlockHash, OutPoint, Psbt, Transaction, TxIn,
         TxOut,
     };
+    use bitcoind_async_client::types::SignRawTransactionWithWallet;
     use corepc_node::{serde_json::json, Conf, Node};
+    use strata_bridge_common::logging::{self, LoggerConfig};
     use strata_bridge_test_utils::prelude::generate_keypair;
-    use strata_btcio::rpc::types::SignRawTransactionWithWallet;
-    use strata_common::logging::{self, LoggerConfig};
     use tracing::info;
 
     use super::*;
@@ -209,7 +211,7 @@ mod tests {
         // Setup Bitcoin node
         let mut conf = Conf::default();
         conf.args.push("-txindex=1");
-        let bitcoind = Node::from_downloaded_with_conf(&conf).unwrap();
+        let bitcoind = Node::with_conf("bitcoind", &conf).unwrap();
         let btc_client = &bitcoind.client;
 
         // Get network

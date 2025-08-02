@@ -10,12 +10,14 @@ use strata_bridge_primitives::scripts::taproot::TaprootWitness;
 
 const NONCE_SEED_SIZE: usize = 32;
 
+/// Generates a random public nonce.
 pub fn generate_pubnonce() -> PubNonce {
     let sec_nonce = generate_secnonce();
 
     sec_nonce.public_nonce()
 }
 
+/// Generates a random secret nonce.
 pub fn generate_secnonce() -> SecNonce {
     let mut nonce_seed_bytes = [0u8; NONCE_SEED_SIZE];
     OsRng.fill(&mut nonce_seed_bytes);
@@ -24,11 +26,20 @@ pub fn generate_secnonce() -> SecNonce {
     SecNonce::build(nonce_seed).build()
 }
 
+/// Generates a random partial signature.
 pub fn generate_partial_signature() -> PartialSignature {
     let secret_key = SecretKey::new(&mut OsRng);
 
     PartialSignature::from_slice(secret_key.as_ref())
         .expect("should be able to generate arbitrary partial signature")
+}
+
+/// Generates a random aggregated nonce.
+pub fn generate_agg_nonce() -> AggNonce {
+    let pubnonce1 = generate_pubnonce();
+    let pubnonce2 = generate_pubnonce();
+
+    [pubnonce1, pubnonce2].iter().cloned().sum()
 }
 
 /// Generates a musig2-aggregated signature from a single keypair.

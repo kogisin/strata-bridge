@@ -1,4 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+//! In-memory database traits and implementations for the public.
+
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use bitcoin::{OutPoint, Txid};
@@ -10,42 +15,50 @@ use tracing::trace;
 
 use crate::{errors::DbResult, public::PublicDb};
 
+/// A map of transaction input to signature.
 pub type TxInputToSignatureMap = HashMap<(Txid, u32), Signature>;
+
+/// A map of operator index to transaction input to signature.
 pub type OperatorIdxToTxInputSigMap = HashMap<OperatorIdx, TxInputToSignatureMap>;
 
+/// In-memory database for the public.
 // Assume that no node will update other nodes' data in this public db.
 #[derive(Debug, Default, Clone)]
 pub struct PublicDbInMemory {
-    // operator_id -> deposit_txid -> WotsPublicKeys
+    /// operator_id -> deposit_txid -> WotsPublicKeys
     wots_public_keys: Arc<RwLock<HashMap<OperatorIdx, HashMap<Txid, wots::PublicKeys>>>>,
 
-    // operator_id -> deposit_txid -> WotsSignatures
+    /// operator_id -> deposit_txid -> WotsSignatures
     wots_signatures: Arc<RwLock<HashMap<OperatorIdx, HashMap<Txid, wots::Signatures>>>>,
 
-    // signature cache per txid and input index per operator
+    /// signature cache per txid and input index per operator
     signatures: Arc<RwLock<OperatorIdxToTxInputSigMap>>,
 
-    // deposit_txid -> deposit_id
+    /// deposit_txid -> deposit_id
     deposits_table: Arc<RwLock<HashMap<Txid, u32>>>,
 
-    // operator_id -> deposit_id -> stake_txid
+    /// operator_id -> deposit_id -> stake_txid
     stake_txid_table: Arc<RwLock<HashMap<OperatorIdx, HashMap<u32, Txid>>>>,
 
-    // operator_id -> pre stake txid
+    /// operator_id -> pre stake txid
     pre_stake_table: Arc<RwLock<HashMap<OperatorIdx, OutPoint>>>,
 
-    // operator_id -> stake_id -> stake_data
+    /// operator_id -> stake_id -> stake_data
     stake_data: Arc<RwLock<HashMap<OperatorIdx, HashMap<u32, StakeTxData>>>>,
 
-    // reverse mapping
+    /// reverse mapping
+    /// claim_txid -> (operator_index, deposit_txid)
     claim_txid_to_operator_index_and_deposit_txid: Arc<RwLock<HashMap<Txid, (OperatorIdx, Txid)>>>,
 
+    /// pre_assert_txid -> (operator_index, deposit_txid)
     pre_assert_txid_to_operator_index_and_deposit_txid:
         Arc<RwLock<HashMap<Txid, (OperatorIdx, Txid)>>>,
 
+    /// assert_data_txid -> (operator_index, deposit_txid)
     assert_data_txid_to_operator_index_and_deposit_txid:
         Arc<RwLock<HashMap<Txid, (OperatorIdx, Txid)>>>,
 
+    /// post_assert_txid -> (operator_index, deposit_txid)
     post_assert_txid_to_operator_index_and_deposit_txid:
         Arc<RwLock<HashMap<Txid, (OperatorIdx, Txid)>>>,
 }
@@ -54,49 +67,49 @@ pub struct PublicDbInMemory {
 impl PublicDb for PublicDbInMemory {
     async fn get_wots_public_keys(
         &self,
-        operator_id: u32,
+        operator_idx: OperatorIdx,
         deposit_txid: Txid,
     ) -> DbResult<Option<wots::PublicKeys>> {
         Ok(self
             .wots_public_keys
             .read()
             .await
-            .get(&operator_id)
+            .get(&operator_idx)
             .and_then(|m| m.get(&deposit_txid))
-            .copied())
+            .cloned())
     }
 
     async fn get_wots_signatures(
         &self,
-        operator_id: u32,
+        operator_idx: OperatorIdx,
         deposit_txid: Txid,
     ) -> DbResult<Option<wots::Signatures>> {
         Ok(self
             .wots_signatures
             .read()
             .await
-            .get(&operator_id)
+            .get(&operator_idx)
             .and_then(|m| m.get(&deposit_txid))
             .cloned())
     }
 
     async fn set_wots_public_keys(
         &self,
-        operator_id: u32,
+        operator_idx: OperatorIdx,
         deposit_txid: Txid,
         public_keys: &wots::PublicKeys,
     ) -> DbResult<()> {
-        trace!(action = "trying to acquire wlock on wots public keys", %operator_id, %deposit_txid);
+        trace!(action = "trying to acquire wlock on wots public keys", %operator_idx, %deposit_txid);
         let mut map = self.wots_public_keys.write().await;
-        trace!(event = "wlock acquired on wots public keys", %operator_id, %deposit_txid);
+        trace!(event = "wlock acquired on wots public keys", %operator_idx, %deposit_txid);
 
-        if let Some(op_keys) = map.get_mut(&operator_id) {
-            op_keys.insert(deposit_txid, *public_keys);
+        if let Some(op_keys) = map.get_mut(&operator_idx) {
+            op_keys.insert(deposit_txid, public_keys.clone());
         } else {
             let mut keys = HashMap::new();
-            keys.insert(deposit_txid, *public_keys);
+            keys.insert(deposit_txid, public_keys.clone());
 
-            map.insert(operator_id, keys);
+            map.insert(operator_idx, keys);
         }
 
         Ok(())
@@ -119,21 +132,21 @@ impl PublicDb for PublicDbInMemory {
 
     async fn set_wots_signatures(
         &self,
-        operator_id: u32,
+        operator_idx: OperatorIdx,
         deposit_txid: Txid,
         signatures: &wots::Signatures,
     ) -> DbResult<()> {
-        trace!(action = "trying to acquire wlock on wots signatures", %operator_id, %deposit_txid);
+        trace!(action = "trying to acquire lock on wots signatures", %operator_idx, %deposit_txid);
         let mut map = self.wots_signatures.write().await;
-        trace!(event = "wlock acquired on wots signatures", %operator_id, %deposit_txid);
+        trace!(event = "wlock acquired on wots signatures", %operator_idx, %deposit_txid);
 
-        if let Some(op_keys) = map.get_mut(&operator_id) {
+        if let Some(op_keys) = map.get_mut(&operator_idx) {
             op_keys.insert(deposit_txid, signatures.clone());
         } else {
             let mut sigs_map = HashMap::new();
             sigs_map.insert(deposit_txid, signatures.clone());
 
-            map.insert(operator_id, sigs_map);
+            map.insert(operator_idx, sigs_map);
         }
 
         Ok(())
@@ -174,20 +187,20 @@ impl PublicDb for PublicDbInMemory {
         Ok(self.deposits_table.read().await.get(&deposit_txid).copied())
     }
 
-    async fn add_stake_txid(&self, operator_id: OperatorIdx, stake_txid: Txid) -> DbResult<()> {
+    async fn add_stake_txid(&self, operator_idx: OperatorIdx, stake_txid: Txid) -> DbResult<()> {
         let mut stake_txid_table = self.stake_txid_table.write().await;
         // get number of stake ids for this operator
         let stake_id = stake_txid_table
-            .get(&operator_id)
+            .get(&operator_idx)
             .map_or(0, |m| m.keys().count() as u32);
 
-        if let Some(m) = stake_txid_table.get_mut(&operator_id) {
+        if let Some(m) = stake_txid_table.get_mut(&operator_idx) {
             m.insert(stake_id, stake_txid);
         } else {
             let mut m = HashMap::new();
             m.insert(stake_id, stake_txid);
 
-            stake_txid_table.insert(operator_id, m);
+            stake_txid_table.insert(operator_idx, m);
         }
 
         Ok(())
@@ -195,44 +208,66 @@ impl PublicDb for PublicDbInMemory {
 
     async fn get_stake_txid(
         &self,
-        operator_id: OperatorIdx,
+        operator_idx: OperatorIdx,
         stake_id: u32,
     ) -> DbResult<Option<Txid>> {
         Ok(self
             .stake_txid_table
             .read()
             .await
-            .get(&operator_id)
+            .get(&operator_idx)
             .and_then(|m| m.get(&stake_id))
             .copied())
     }
 
-    async fn set_pre_stake(&self, operator_id: OperatorIdx, pre_stake: OutPoint) -> DbResult<()> {
-        let mut pre_stake_table = self.pre_stake_table.write().await;
-        pre_stake_table.insert(operator_id, pre_stake);
+    async fn add_all_stake_data(&self, data: Vec<(OperatorIdx, u32, StakeTxData)>) -> DbResult<()> {
+        let mut operator_stake_data = self.stake_data.write().await;
+
+        for (operator_idx, stake_index, stake_data) in data {
+            if let Some(data) = operator_stake_data.get_mut(&operator_idx) {
+                data.insert(stake_index, stake_data);
+            } else {
+                let mut data = HashMap::new();
+                data.insert(stake_index, stake_data);
+
+                operator_stake_data.insert(operator_idx, data);
+            }
+        }
 
         Ok(())
     }
 
-    async fn get_pre_stake(&self, operator_id: OperatorIdx) -> DbResult<Option<OutPoint>> {
-        Ok(self.pre_stake_table.read().await.get(&operator_id).copied())
+    async fn set_pre_stake(&self, operator_idx: OperatorIdx, pre_stake: OutPoint) -> DbResult<()> {
+        let mut pre_stake_table = self.pre_stake_table.write().await;
+        pre_stake_table.insert(operator_idx, pre_stake);
+
+        Ok(())
+    }
+
+    async fn get_pre_stake(&self, operator_idx: OperatorIdx) -> DbResult<Option<OutPoint>> {
+        Ok(self
+            .pre_stake_table
+            .read()
+            .await
+            .get(&operator_idx)
+            .copied())
     }
 
     async fn add_stake_data(
         &self,
-        operator_id: OperatorIdx,
+        operator_idx: OperatorIdx,
         stake_index: u32,
         stake_data: StakeTxData,
     ) -> DbResult<()> {
         let mut operator_stake_data = self.stake_data.write().await;
 
-        if let Some(data) = operator_stake_data.get_mut(&operator_id) {
+        if let Some(data) = operator_stake_data.get_mut(&operator_idx) {
             data.insert(stake_index, stake_data);
         } else {
             let mut data = HashMap::new();
             data.insert(stake_index, stake_data);
 
-            operator_stake_data.insert(operator_id, data);
+            operator_stake_data.insert(operator_idx, data);
         }
 
         Ok(())
@@ -249,17 +284,24 @@ impl PublicDb for PublicDbInMemory {
             .await
             .get(&operator_idx)
             .and_then(|m| m.get(&deposit_id))
-            .copied())
+            .cloned())
     }
 
-    async fn get_all_stake_data(&self, operator_idx: OperatorIdx) -> DbResult<Vec<StakeTxData>> {
+    async fn get_all_stake_data(
+        &self,
+        operator_idx: OperatorIdx,
+    ) -> DbResult<BTreeMap<u32, StakeTxData>> {
         Ok(self
             .stake_data
             .read()
             .await
             .get(&operator_idx)
-            .map(|map| map.values().cloned().collect())
-            .unwrap_or(vec![]))
+            .map(|map| {
+                map.iter()
+                    .map(|(deposit_idx, stake_data)| (*deposit_idx, stake_data.clone()))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn register_claim_txid(

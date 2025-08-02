@@ -1,4 +1,6 @@
-use bitcoin::{BlockHash, Transaction};
+use std::fmt;
+
+use bitcoin::{Block, BlockHash, Transaction};
 
 /// TxStatus is the primary output of this API via the subscription.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -44,6 +46,33 @@ pub enum TxStatus {
     },
 }
 
+impl fmt::Display for TxStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TxStatus::Unknown => write!(f, "unknown"),
+            TxStatus::Mempool => write!(f, "in mempool"),
+            TxStatus::Mined { blockhash, height } => {
+                write!(f, "mined in block {height} ({blockhash})")
+            }
+            TxStatus::Buried { blockhash, height } => {
+                write!(f, "buried in block {height} ({blockhash})")
+            }
+        }
+    }
+}
+
+impl TxStatus {
+    /// Returns true if the status is some sort of [`TxStatus::Mined`] status.
+    pub const fn is_mined(&self) -> bool {
+        matches!(self, TxStatus::Mined { .. })
+    }
+
+    /// Returns true if the status is some sort of [`TxStatus::Buried`] status.
+    pub const fn is_buried(&self) -> bool {
+        matches!(self, TxStatus::Buried { .. })
+    }
+}
+
 /// Type that is emitted to Subscriptions created with
 /// [`crate::client::BtcZmqClient::subscribe_transactions`].
 ///
@@ -56,4 +85,27 @@ pub struct TxEvent {
 
     /// The new [`TxStatus`] that this event is reporting for the transaction.
     pub status: TxStatus,
+}
+
+/// This is emitted as a pair with block events to denote what is happening to the block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlockStatus {
+    /// A block that was once connected to the main chain has been disconnected.
+    Uncled,
+
+    /// A block has been connected to the main chain.
+    Mined,
+
+    /// A block has been buried under the configured number of blocks in the main chain.
+    Buried,
+}
+
+/// Event type that is emitted to indicate what is happening with a given block.
+#[derive(Debug, Clone)]
+pub struct BlockEvent {
+    /// The actual block data for the block event in question.
+    pub block: Block,
+
+    /// The status of the block as of this event.
+    pub status: BlockStatus,
 }

@@ -6,7 +6,7 @@ use bitcoin::{
     TapNodeHash, XOnlyPublicKey,
 };
 use musig2::secp256k1::{schnorr::Signature, Message, SECP256K1};
-use secret_service_proto::v1::traits::{Origin, Server, WalletSigner};
+use secret_service_proto::v2::traits::{Origin, SchnorrSigner, Server};
 use strata_bridge_primitives::secp::EvenSecretKey;
 
 use super::paths::{GENERAL_WALLET_KEY_PATH, STAKECHAIN_WALLET_KEY_PATH};
@@ -29,7 +29,7 @@ impl GeneralWalletSigner {
     }
 }
 
-impl WalletSigner<Server> for GeneralWalletSigner {
+impl SchnorrSigner<Server> for GeneralWalletSigner {
     async fn sign(
         &self,
         digest: &[u8; 32],
@@ -37,7 +37,7 @@ impl WalletSigner<Server> for GeneralWalletSigner {
     ) -> <Server as Origin>::Container<Signature> {
         self.kp
             .tap_tweak(SECP256K1, tweak)
-            .to_inner()
+            .to_keypair()
             .sign_schnorr(Message::from_digest_slice(digest).unwrap())
     }
 
@@ -69,7 +69,7 @@ impl StakechainWalletSigner {
     }
 }
 
-impl WalletSigner<Server> for StakechainWalletSigner {
+impl SchnorrSigner<Server> for StakechainWalletSigner {
     async fn sign(
         &self,
         digest: &[u8; 32],
@@ -77,7 +77,7 @@ impl WalletSigner<Server> for StakechainWalletSigner {
     ) -> <Server as Origin>::Container<Signature> {
         self.kp
             .tap_tweak(SECP256K1, tweak)
-            .to_inner()
+            .to_keypair()
             .sign_schnorr(Message::from_digest_slice(digest).unwrap())
     }
 

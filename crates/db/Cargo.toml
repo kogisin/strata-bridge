@@ -4,11 +4,7 @@ name = "strata-bridge-db"
 version = "0.1.0"
 
 [lints]
-rust.missing_debug_implementations = "warn"
-rust.rust_2018_idioms = { level = "deny", priority = -1 }
-rust.unreachable_pub = "warn"
-rust.unused_crate_dependencies = "deny"
-rust.unused_must_use = "deny"
+workspace = true
 
 [dependencies]
 strata-bridge-primitives.workspace = true
@@ -21,7 +17,6 @@ musig2 = { workspace = true, features = ["serde"] }
 rkyv.workspace = true
 secp256k1 = { workspace = true, features = ["global-context", "rand-std"] }
 serde.workspace = true
-serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

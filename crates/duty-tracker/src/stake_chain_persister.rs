@@ -2,12 +2,12 @@
 //! retrieving it when needed.
 use std::collections::BTreeMap;
 
-use bitcoin::{OutPoint, XOnlyPublicKey};
+use bitcoin::{hex::DisplayHex, OutPoint};
 use strata_bridge_db::{errors::DbError, persistent::sqlite::SqliteDb, public::PublicDb};
 use strata_bridge_primitives::operator_table::OperatorTable;
 use strata_bridge_stake_chain::stake_chain::StakeChainInputs;
 use strata_p2p_types::P2POperatorPubKey;
-use tracing::warn;
+use tracing::{debug, info, trace, warn};
 
 /// A database wrapper for dumping ad retrieving stake chain data.
 #[derive(Debug)]
@@ -36,19 +36,32 @@ impl StakeChainPersister {
         cfg: &OperatorTable,
         state: BTreeMap<P2POperatorPubKey, StakeChainInputs>,
     ) -> Result<(), DbError> {
-        let op_id_and_chain_inputs = state.iter().filter_map(|(p2p_key, chain_inputs)| {
-            // extract only those with valid operator ids
-            cfg.op_key_to_idx(p2p_key)
-                .map(|op_id| (op_id, chain_inputs))
-        });
+        let op_id_and_chain_inputs = cfg
+            .convert_map_p2p_to_idx(state)
+            .expect("fully saturated stake chain inputs");
 
+        info!(
+            "preparing the required information to commit all operator's stake chain data to disk"
+        );
+        let mut stake_chain_data = Vec::new();
         for (operator_id, chain_inputs) in op_id_and_chain_inputs {
-            for (stake_index, stake_input) in chain_inputs.stake_inputs.iter().enumerate() {
-                self.db
-                    .add_stake_data(operator_id, stake_index as u32, stake_input.to_owned())
-                    .await?;
+            for (stake_index, stake_input) in chain_inputs.stake_inputs.into_iter() {
+                trace!(
+                    %operator_id,
+                    %stake_index,
+                    ?stake_input,
+                    "constructing stake data to commit to disk"
+                );
+
+                stake_chain_data.push((operator_id, stake_index, stake_input));
             }
         }
+
+        info!("committing all operator's stake chain data to disk");
+        let num_inputs = stake_chain_data.len();
+        self.db.add_all_stake_data(stake_chain_data).await?;
+        debug!(%num_inputs, "all operator's stake chain data committed to disk");
+
         Ok(())
     }
 
@@ -56,37 +69,30 @@ impl StakeChainPersister {
     pub async fn load(
         &self,
         cfg: &OperatorTable,
-        operator_pubkey: XOnlyPublicKey,
     ) -> Result<BTreeMap<P2POperatorPubKey, StakeChainInputs>, DbError> {
         let mut stake_chain_inputs = BTreeMap::new();
         let operator_ids = cfg.operator_idxs();
 
         for operator_id in operator_ids {
-            let stake_data = self.db.get_all_stake_data(operator_id).await?;
+            let stake_inputs = self.db.get_all_stake_data(operator_id).await?;
             let pre_stake_outpoint = self.db.get_pre_stake(operator_id).await?;
-            let p2p_key = cfg.idx_to_op_key(&operator_id);
+            let p2p_key = cfg.idx_to_p2p_key(&operator_id);
 
             match (pre_stake_outpoint, p2p_key) {
                 (Some(pre_stake_outpoint), Some(p2p_key)) => {
                     stake_chain_inputs.insert(
                         p2p_key.clone(),
                         StakeChainInputs {
-                            operator_pubkey,
                             pre_stake_outpoint,
-                            // NOTE: (@Rajil1213) convert stake data to an IndexedSet to avoid this
-                            // conversion alternatively, this is okay
-                            // since the loading of the stake data only
-                            // happens once.
-                            stake_inputs: stake_data.into_iter().collect(),
+                            stake_inputs,
                         },
                     );
                 }
                 _ => {
                     warn!(
-                        ?stake_data,
+                        ?stake_inputs,
                         ?pre_stake_outpoint,
-                        ?p2p_key,
-                        ?operator_pubkey,
+                        p2p_key = ?p2p_key.map(|k| Vec::<u8>::from(k.clone()).to_lower_hex_string()),
                         "ignoring incomplete data"
                     );
                 }

@@ -1,8 +1,13 @@
 //! This module contains a generic connector for all outputs locked in a taproot address
 //! spendable by a single key path with N-of-N musig2-aggregated signatures.
+use std::slice;
+
 use bitcoin::{
     hashes::{sha256, Hash},
-    opcodes::all::{OP_CHECKSIGVERIFY, OP_CSV, OP_EQUALVERIFY, OP_SHA256, OP_SIZE},
+    opcodes::{
+        all::{OP_CHECKSIGVERIFY, OP_CSV, OP_EQUALVERIFY, OP_SHA256, OP_SIZE},
+        OP_TRUE,
+    },
     psbt::Input,
     relative,
     taproot::{ControlBlock, LeafVersion},
@@ -71,7 +76,7 @@ pub struct ConnectorStake {
 impl ConnectorStake {
     /// Creates a new [`ConnectorStake`] with the given N-of-N aggregated public key, `k`th stake
     /// preimage, and the bitcoin network.
-    pub fn new(
+    pub const fn new(
         n_of_n_agg_pubkey: XOnlyPublicKey,
         operator_pubkey: XOnlyPublicKey,
         stake_hash: sha256::Hash,
@@ -104,7 +109,7 @@ impl ConnectorStake {
     /// <stake_preimage> OP_EQUALVERIFY <ΔS> OP_CHECKSEQUENCEVERIFY
     /// ```
     pub fn generate_script(&self) -> ScriptBuf {
-        ScriptBuf::builder()
+        let locking_script = ScriptBuf::builder()
             .push_slice(self.operator_pubkey.serialize())
             .push_opcode(OP_CHECKSIGVERIFY)
             .push_opcode(OP_SIZE)
@@ -112,10 +117,19 @@ impl ConnectorStake {
             .push_opcode(OP_EQUALVERIFY)
             .push_opcode(OP_SHA256)
             .push_slice(self.stake_hash.to_byte_array())
-            .push_opcode(OP_EQUALVERIFY)
-            .push_sequence(self.delta.into())
-            .push_opcode(OP_CSV)
-            .into_script()
+            .push_opcode(OP_EQUALVERIFY);
+
+        // handle `0`-locktime differently as pushing `0` sequence means no element is pushed which
+        // results in the stack being empty when it is executed when spending.
+        let locking_script = if self.delta != relative::LockTime::ZERO {
+            locking_script
+                .push_sequence(self.delta.into())
+                .push_opcode(OP_CSV)
+        } else {
+            locking_script.push_opcode(OP_TRUE)
+        };
+
+        locking_script.into_script()
     }
 
     /// Creates a P2TR address with key spend path for the given operator set and a single script
@@ -146,7 +160,7 @@ impl ConnectorStake {
             &self.network,
             SpendPath::Both {
                 internal_key: self.n_of_n_agg_pubkey,
-                scripts: &[script.clone()],
+                scripts: slice::from_ref(&script),
             },
         )
         .expect("should be able to create taproot address");
@@ -219,11 +233,11 @@ mod tests {
         transaction, Amount, BlockHash, OutPoint, Psbt, TapLeafHash, TapSighashType, Transaction,
         TxIn, TxOut,
     };
+    use bitcoind_async_client::types::SignRawTransactionWithWallet;
     use corepc_node::{serde_json::json, Conf, Node};
     use secp256k1::{Message, SECP256K1};
+    use strata_bridge_common::logging::{self, LoggerConfig};
     use strata_bridge_test_utils::prelude::generate_keypair;
-    use strata_btcio::rpc::types::SignRawTransactionWithWallet;
-    use strata_common::logging::{self, LoggerConfig};
     use tracing::{info, trace};
 
     use super::*;
@@ -235,7 +249,7 @@ mod tests {
         // Setup Bitcoin node
         let mut conf = Conf::default();
         conf.args.push("-txindex=1");
-        let bitcoind = Node::from_downloaded_with_conf(&conf).unwrap();
+        let bitcoind = Node::with_conf("bitcoind", &conf).unwrap();
         let btc_client = &bitcoind.client;
 
         // Get network
